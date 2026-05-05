@@ -1,0 +1,75 @@
+[package]
+name = "gnps-massive-to-mgf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+description = "Build a deduplicated MassIVE mzML-derived MS/MS MGF corpus."
+repository = "https://github.com/LucaCappelletti94/gnps-massive-to-mgf"
+keywords = ["mass-spectrometry", "mzml", "mgf", "massive", "gnps"]
+categories = ["science"]
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+csv = "1.4.0"
+diesel = { version = "2.3.3", features = ["sqlite", "chrono", "returning_clauses_for_sqlite_3_35"] }
+dotenvy = "0.15.7"
+futures-util = "0.3.32"
+indicatif = "0.18.4"
+mascot-rs = { git = "https://github.com/LucaCappelletti94/mascot-rs" }
+mzdata = { version = "0.63.4", default-features = false, features = ["mzml", "zlib-ng-compat"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "stream"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.0"
+tokio = { version = "1.52.2", features = ["fs", "macros", "net", "rt-multi-thread", "sync"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+urlencoding = "2.1.3"
+zenodo-rs = "0.1.6"
+zstd = { version = "0.13.3", features = ["zstdmt"] }
+
+[dev-dependencies]
+axum = "0.8.7"
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+missing_docs = "deny"
+warnings = "deny"
+
+[lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+allow_attributes_without_reason = "deny"
+as_conversions = "deny"
+clone_on_ref_ptr = "deny"
+error_impl_error = "deny"
+exit = "deny"
+float_cmp_const = "deny"
+get_unwrap = "deny"
+let_underscore_must_use = "deny"
+map_err_ignore = "deny"
+string_add = "deny"
+string_lit_as_bytes = "deny"
+try_err = "deny"
+unnecessary_safety_comment = "deny"
+verbose_file_reads = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+doc_markdown = "allow"
+multiple_crate_versions = "allow"
