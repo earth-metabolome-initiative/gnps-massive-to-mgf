@@ -716,10 +716,10 @@ fn append_known_param(metadata: &mut BTreeMap<String, String>, param: &Param) {
 
 /// Returns the canonical MGF header for a known mzML param.
 fn canonical_mzml_metadata_header(param: &Param) -> Option<&'static str> {
-    if param.controlled_vocabulary == Some(ControlledVocabulary::MS) {
-        if let Some(header) = canonical_ms_accession_metadata_header(param.accession?) {
-            return Some(header);
-        }
+    if param.controlled_vocabulary == Some(ControlledVocabulary::MS)
+        && let Some(header) = canonical_ms_accession_metadata_header(param.accession?)
+    {
+        return Some(header);
     }
     canonical_metadata_name_alias(&normalized_metadata_name(&param.name))
 }

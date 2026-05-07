@@ -1044,11 +1044,11 @@ fn create_sqlite_parent(database_url: &str) -> anyhow::Result<()> {
     if database_url == ":memory:" || database_url.starts_with("file:") {
         return Ok(());
     }
-    if let Some(parent) = Path::new(database_url).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+    if let Some(parent) = Path::new(database_url).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     Ok(())
 }

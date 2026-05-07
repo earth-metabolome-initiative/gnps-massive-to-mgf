@@ -2,7 +2,7 @@
 name = "gnps-massive-to-mgf"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.93"
 license = "MIT"
 description = "Build a deduplicated MassIVE mzML-derived MS/MS MGF corpus."
 repository = "https://github.com/LucaCappelletti94/gnps-massive-to-mgf"
@@ -37,6 +37,8 @@ tempfile = "3.27.0"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+debug = "line-tables-only"
+strip = "none"
 
 [lints.rust]
 missing_docs = "deny"
