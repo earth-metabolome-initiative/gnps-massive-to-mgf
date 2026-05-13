@@ -24,7 +24,7 @@ pub mod zenodo_publish;
 
 pub use config::Config;
 pub use conversion::{ConversionSummary, convert_downloaded_mzml};
-pub use db::StateDb;
+pub use db::{DownloadProgressTotals, StateDb};
 pub use index::{OpenFormatRecord, SourceFileStatus, ingest_openformats};
 pub use massive::download_pending_mzml;
 pub use pipeline::{PipelineDecision, decide_next_pipeline_step, run_pipeline};

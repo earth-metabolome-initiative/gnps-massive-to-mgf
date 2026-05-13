@@ -105,6 +105,20 @@ pub struct FinalizedShardRow {
     pub sha256: Option<String>,
 }
 
+/// Cumulative download workload totals across the planned source files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DownloadProgressTotals {
+    /// Files whose download is planned (downloaded, indexed, or failed).
+    pub planned_files: u64,
+    /// Total bytes summed across the planned files.
+    pub planned_bytes: u64,
+    /// Files already downloaded successfully.
+    pub completed_files: u64,
+    /// Bytes already downloaded successfully.
+    pub completed_bytes: u64,
+}
+
 /// Aggregate conversion counters for one top-k setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -170,6 +184,7 @@ impl StateDb {
                 "\
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 60000;
 CREATE TABLE IF NOT EXISTS source_files (
     filepath TEXT PRIMARY KEY NOT NULL,
     dataset TEXT NOT NULL,
@@ -377,6 +392,53 @@ WHERE status = 'indexed'
         .get_result::<SumRow>(&mut self.connection)
         .context("failed to sum pending download bytes")?;
         i64_to_u64(row.bytes, "pending download byte count")
+    }
+
+    /// Returns cumulative file and byte totals across the planned download workload.
+    ///
+    /// The planned set spans every source file already downloaded, still queued
+    /// for download, or marked as a previous download failure. The completed
+    /// counters cover only files already on disk and persisted to the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SQLite` rejects the query or returns negative totals.
+    pub fn download_progress_totals(&mut self) -> anyhow::Result<DownloadProgressTotals> {
+        #[derive(QueryableByName)]
+        struct TotalsRow {
+            /// Number of planned files.
+            #[diesel(sql_type = BigInt)]
+            planned_files: i64,
+            /// Sum of planned file sizes in bytes.
+            #[diesel(sql_type = BigInt)]
+            planned_bytes: i64,
+            /// Number of files already downloaded successfully.
+            #[diesel(sql_type = BigInt)]
+            completed_files: i64,
+            /// Sum of bytes for files already downloaded successfully.
+            #[diesel(sql_type = BigInt)]
+            completed_bytes: i64,
+        }
+
+        let row = sql_query(
+            "\
+SELECT
+    COUNT(*) AS planned_files,
+    COALESCE(SUM(size_bytes), 0) AS planned_bytes,
+    COALESCE(SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END), 0) AS completed_files,
+    COALESCE(SUM(CASE WHEN status = 'downloaded' THEN size_bytes ELSE 0 END), 0) AS completed_bytes
+FROM source_files
+WHERE status IN ('downloaded', 'indexed', 'download_failed')
+",
+        )
+        .get_result::<TotalsRow>(&mut self.connection)
+        .context("failed to read download progress totals")?;
+        Ok(DownloadProgressTotals {
+            planned_files: i64_to_u64(row.planned_files, "planned download file count")?,
+            planned_bytes: i64_to_u64(row.planned_bytes, "planned download byte count")?,
+            completed_files: i64_to_u64(row.completed_files, "completed download file count")?,
+            completed_bytes: i64_to_u64(row.completed_bytes, "completed download byte count")?,
+        })
     }
 
     /// Moves previous failed downloads back to the indexed queue for a new run.
@@ -1057,6 +1119,9 @@ fn create_sqlite_parent(database_url: &str) -> anyhow::Result<()> {
 mod tests {
     use std::path::Path;
 
+    use diesel::sql_types::BigInt;
+    use diesel::{QueryableByName, RunQueryDsl};
+
     use crate::index::{OpenFormatRecord, SourceFileStatus};
 
     use super::{SourceConversionRecord, SpectrumSeenRecord, StateDb};
@@ -1067,6 +1132,64 @@ mod tests {
         let mut db = StateDb::connect(":memory:")?;
         db.initialize()?;
         assert_eq!(db.count_status(crate::index::SourceFileStatus::Indexed)?, 0);
+        Ok(())
+    }
+
+    /// Confirms connections wait briefly for concurrent SQLite writers.
+    #[test]
+    fn initializes_sqlite_busy_timeout() -> anyhow::Result<()> {
+        #[derive(QueryableByName)]
+        struct BusyTimeoutRow {
+            #[diesel(sql_type = BigInt)]
+            timeout: i64,
+        }
+
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+        let row = diesel::sql_query("PRAGMA busy_timeout")
+            .get_result::<BusyTimeoutRow>(&mut db.connection)?;
+        assert_eq!(row.timeout, 60_000);
+        Ok(())
+    }
+
+    /// Confirms download progress totals fold completed and pending work together.
+    #[test]
+    fn download_progress_totals_combine_completed_and_pending() -> anyhow::Result<()> {
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+        let downloaded_record = test_record_with_size("MSV000000001/path/done.mzML", 1.0, 1_000);
+        let pending_record = test_record_with_size("MSV000000001/path/pending.mzML", 1.0, 2_500);
+        let failed_record = test_record_with_size("MSV000000001/path/failed.mzML", 1.0, 500);
+        let candidate_record = test_record_with_size("MSV000000001/path/candidate.mzML", 1.0, 9_000);
+        db.upsert_source_file(
+            &downloaded_record,
+            Path::new("/tmp/done.mzML"),
+            0,
+            SourceFileStatus::Downloaded,
+        )?;
+        db.upsert_source_file(
+            &pending_record,
+            Path::new("/tmp/pending.mzML"),
+            1,
+            SourceFileStatus::Indexed,
+        )?;
+        db.upsert_source_file(
+            &failed_record,
+            Path::new("/tmp/failed.mzML"),
+            2,
+            SourceFileStatus::DownloadFailed,
+        )?;
+        db.upsert_source_file(
+            &candidate_record,
+            Path::new("/tmp/candidate.mzML"),
+            3,
+            SourceFileStatus::Candidate,
+        )?;
+        let totals = db.download_progress_totals()?;
+        assert_eq!(totals.planned_files, 3);
+        assert_eq!(totals.planned_bytes, 4_000);
+        assert_eq!(totals.completed_files, 1);
+        assert_eq!(totals.completed_bytes, 1_000);
         Ok(())
     }
 
@@ -1146,12 +1269,17 @@ mod tests {
 
     /// Builds a small test open-format record.
     fn test_record(filepath: &str, spectra_ms2: f64) -> OpenFormatRecord {
+        test_record_with_size(filepath, spectra_ms2, 1)
+    }
+
+    /// Builds a small test open-format record with a specific byte size.
+    fn test_record_with_size(filepath: &str, spectra_ms2: f64, size: u64) -> OpenFormatRecord {
         OpenFormatRecord {
             filepath: filepath.to_owned(),
             dataset: "MSV000000001".to_owned(),
             collection: "peak".to_owned(),
             create_time: "2021-01-01 00:00:00".to_owned(),
-            size: 1,
+            size,
             size_mb: 1,
             spectra_ms1: Some(1.0),
             spectra_ms2: Some(spectra_ms2),

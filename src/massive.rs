@@ -141,21 +141,33 @@ async fn download_pending_mzml_with_client(
     if reset > 0 {
         progress.println(format!("retrying {reset} previously failed download(s)"))?;
     }
-    let indexed = db.count_status(SourceFileStatus::Indexed)?;
-    let pending_bytes = db.pending_download_bytes()?;
-    let mut remaining = indexed;
-    let mut downloaded = 0_u64;
+    let totals = db.download_progress_totals()?;
+    let mut remaining = db.count_status(SourceFileStatus::Indexed)?;
+    let mut downloaded = totals.completed_files;
     let mut failed = 0_u64;
     progress.println(format!(
-        "download queue: {remaining} mzML files, workers {}",
-        config.download_workers
+        "download queue: {remaining} of {} planned mzML file(s) remaining, workers {}",
+        totals.planned_files, config.download_workers,
     ))?;
-    let files_bar = (indexed > 0)
-        .then(|| progress.count_bar(indexed, format!("download files | remaining={remaining}")))
+    let files_bar = (totals.planned_files > 0)
+        .then(|| {
+            progress.count_bar(
+                totals.planned_files,
+                format!(
+                    "download files | downloaded_or_present={downloaded} failed={failed} remaining={remaining}"
+                ),
+            )
+        })
         .transpose()?;
-    let bytes_bar = (pending_bytes > 0)
-        .then(|| progress.byte_bar(pending_bytes, "download total bytes"))
+    if let Some(bar) = &files_bar {
+        bar.inc(totals.completed_files);
+    }
+    let bytes_bar = (totals.planned_bytes > 0)
+        .then(|| progress.byte_bar(totals.planned_bytes, "download total bytes"))
         .transpose()?;
+    if let Some(bar) = &bytes_bar {
+        bar.inc(totals.completed_bytes);
+    }
     let aggregate_progress = AggregateDownloadProgress::new(bytes_bar.clone());
     let worker_count = config.download_workers.max(1);
 

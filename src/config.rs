@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(config.mgf_output_dir, PathBuf::from("/mnt/bfd/mgf"));
         assert_eq!(config.target_ms2_spectra, 200_000_000);
         assert_eq!(config.top_k_peaks, 256);
-        assert_eq!(config.http_request_timeout, Some(Duration::from_secs(600)));
+        assert_eq!(config.http_request_timeout, Some(Duration::from_mins(10)));
         assert!(!config.publish_to_zenodo);
         Ok(())
     }
