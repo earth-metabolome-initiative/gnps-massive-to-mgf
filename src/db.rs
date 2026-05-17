@@ -1160,7 +1160,8 @@ mod tests {
         let downloaded_record = test_record_with_size("MSV000000001/path/done.mzML", 1.0, 1_000);
         let pending_record = test_record_with_size("MSV000000001/path/pending.mzML", 1.0, 2_500);
         let failed_record = test_record_with_size("MSV000000001/path/failed.mzML", 1.0, 500);
-        let candidate_record = test_record_with_size("MSV000000001/path/candidate.mzML", 1.0, 9_000);
+        let candidate_record =
+            test_record_with_size("MSV000000001/path/candidate.mzML", 1.0, 9_000);
         db.upsert_source_file(
             &downloaded_record,
             Path::new("/tmp/done.mzML"),
