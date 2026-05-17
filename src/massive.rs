@@ -301,7 +301,7 @@ async fn download_once(
             )
         })?;
         aggregate_progress.set_file_bytes(&source.filepath, expected_bytes)?;
-        bar.finish_with_message(format!("downloaded {}", source.filepath));
+        bar.finish_and_clear();
         return Ok(expected_bytes);
     }
     let can_resume = existing_part > 0 && existing_part < expected_bytes;
@@ -376,7 +376,7 @@ async fn download_once(
             destination.display()
         )
     })?;
-    bar.finish_with_message(format!("downloaded {}", source.filepath));
+    bar.finish_and_clear();
     Ok(downloaded)
 }
 
