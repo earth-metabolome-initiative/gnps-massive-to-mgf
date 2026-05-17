@@ -18,7 +18,7 @@ cargo run --release -- publish-dry-run
 cargo run --release -- publish
 ```
 
-`cargo run --release -- run` executes the same stages in order. Downloads use `DOWNLOAD_WORKERS` concurrent MassIVE transfers. Keep it at `1` for the initial production run, then raise it only after the restart behavior and network load look stable. MassIVE runs Apache `mod_qos` and rejects with `HTTP 429 Too Many Requests` once a per-IP threshold is hit; empirically `DOWNLOAD_WORKERS=8` sustains cleanly while `16` triggers `429`s within the first batch, so do not exceed `8`.
+`cargo run --release -- run` executes the same stages in order. Downloads use `DOWNLOAD_WORKERS` concurrent MassIVE transfers. Keep it at `1` for the initial production run, then raise it only after the restart behavior and network load look stable. MassIVE runs Apache `mod_qos` and rejects with `HTTP 429 Too Many Requests` once a per-IP threshold is hit; empirically `DOWNLOAD_WORKERS=16` triggers `429`s within the first batch, and `8` also produced `429`s clustered on a single dataset under sustained load. `4` is the current best-known sustained value.
 
 Set `HTTP_REQUEST_TIMEOUT_SECONDS=0` to disable the full-transfer timeout for very large mzML files. The downloader retries failed files on the next run and resumes `.part` files when MassIVE accepts byte-range requests.
 
