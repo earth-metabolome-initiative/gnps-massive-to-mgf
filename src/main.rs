@@ -2,9 +2,9 @@
 
 use anyhow::{Context, bail};
 use gnps_massive_to_mgf::{
-    Config, ProgressReporter, StateDb, collect_pipeline_status, convert_downloaded_mzml,
-    download_openformats_indexes, download_pending_mzml, ingest_openformats,
-    ingest_volume_manifest, run_pipeline,
+    Config, IndexFreshness, ProgressReporter, StateDb, collect_pipeline_status,
+    convert_downloaded_mzml, download_pending_mzml, ensure_openformats_indexes_fresh,
+    ingest_openformats, ingest_volume_manifest, run_pipeline,
 };
 
 /// Runs the requested pipeline subcommand.
@@ -25,26 +25,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to initialize state database")?;
 
     match std::env::args().nth(1).as_deref() {
-        Some("index") => {
-            download_openformats_indexes(&config, &progress)
-                .await
-                .context("failed to download open-format index files")?;
-            let report = ingest_openformats(&mut db, &config, &progress)
-                .context("failed to ingest index")?;
-            progress.println(format!(
-                "indexed MassIVE mzML files: {} queued, {} candidates, {} indexed MS/MS spectra",
-                report.inserted_mzml, report.candidate_mzml, report.target_ms2_spectra
-            ))?;
-            let volume_report = ingest_volume_manifest(&mut db, &config, &progress)
-                .context("failed to ingest MassIVE volume manifest")?;
-            progress.println(format!(
-                "ingested MassIVE volume manifest: {} updated, {} skipped, {} planned download(s) still missing a volume",
-                volume_report.rows_updated,
-                volume_report.rows_skipped,
-                volume_report.missing_volume_after_ingest
-            ))?;
-        }
         Some("download") => {
+            refresh_indexes_and_ingest(&mut db, &config, &progress).await?;
             download_pending_mzml(&mut db, &config, &progress)
                 .await
                 .context("failed to download pending mzML files")?;
@@ -68,11 +50,39 @@ async fn main() -> anyhow::Result<()> {
             run_pipeline(&mut db, &config, &progress).await?;
         }
         Some(command) => {
-            bail!(
-                "unknown command {command}; expected one of: index, download, convert, status, run"
-            );
+            bail!("unknown command {command}; expected one of: download, convert, status, run");
         }
     }
 
+    Ok(())
+}
+
+/// Refreshes the open-format indexes when the Zenodo record has been
+/// modified since the local TSVs were last downloaded, then re-ingests
+/// `source_files` if the TSVs were refreshed. Always re-ingests the volume
+/// manifest, which is idempotent and fast.
+async fn refresh_indexes_and_ingest(
+    db: &mut StateDb,
+    config: &Config,
+    progress: &ProgressReporter,
+) -> anyhow::Result<()> {
+    let freshness = ensure_openformats_indexes_fresh(config, progress)
+        .await
+        .context("failed to refresh open-format index files")?;
+    if matches!(freshness, IndexFreshness::Refreshed) {
+        let report = ingest_openformats(db, config, progress).context("failed to ingest index")?;
+        progress.println(format!(
+            "indexed MassIVE mzML files: {} queued, {} candidates, {} indexed MS/MS spectra",
+            report.inserted_mzml, report.candidate_mzml, report.target_ms2_spectra
+        ))?;
+    }
+    let volume_report = ingest_volume_manifest(db, config, progress)
+        .context("failed to ingest MassIVE volume manifest")?;
+    progress.println(format!(
+        "ingested MassIVE volume manifest: {} updated, {} skipped, {} planned download(s) still missing a volume",
+        volume_report.rows_updated,
+        volume_report.rows_skipped,
+        volume_report.missing_volume_after_ingest
+    ))?;
     Ok(())
 }

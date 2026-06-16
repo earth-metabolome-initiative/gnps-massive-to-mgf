@@ -8,7 +8,7 @@ use crate::db::StateDb;
 use crate::index::{ingest_openformats, ingest_volume_manifest};
 use crate::massive::download_pending_mzml;
 use crate::progress::ProgressReporter;
-use crate::zenodo_publish::download_openformats_indexes;
+use crate::zenodo_publish::{IndexFreshness, ensure_openformats_indexes_fresh};
 
 /// Decision made after one download-conversion pipeline round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,10 +32,12 @@ pub async fn run_pipeline(
     progress: &ProgressReporter,
 ) -> anyhow::Result<()> {
     let pipeline_bar = progress.count_bar(2, "pipeline | indexing open-format files")?;
-    download_openformats_indexes(config, progress)
+    let freshness = ensure_openformats_indexes_fresh(config, progress)
         .await
-        .context("failed to download open-format index files")?;
-    ingest_openformats(db, config, progress).context("failed to ingest index")?;
+        .context("failed to refresh open-format index files")?;
+    if matches!(freshness, IndexFreshness::Refreshed) {
+        ingest_openformats(db, config, progress).context("failed to ingest index")?;
+    }
     ingest_volume_manifest(db, config, progress)
         .context("failed to ingest MassIVE volume manifest")?;
     pipeline_bar.inc(1);

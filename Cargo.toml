@@ -21,6 +21,7 @@ mascot-rs = { git = "https://github.com/LucaCappelletti94/mascot-rs" }
 mzdata = { version = "0.63.4", default-features = false, features = ["mzml", "zlib-ng-compat"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+zenodo-rs = { version = "0.2", default-features = false, features = ["rustls-ring-tls", "indicatif"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"

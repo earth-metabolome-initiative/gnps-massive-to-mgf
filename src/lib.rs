@@ -39,4 +39,4 @@ pub use massive::download_pending_mzml;
 pub use pipeline::{PipelineDecision, decide_next_pipeline_step, run_pipeline};
 pub use progress::ProgressReporter;
 pub use status::{PipelineStatus, collect_pipeline_status};
-pub use zenodo_publish::download_openformats_indexes;
+pub use zenodo_publish::{IndexFreshness, ensure_openformats_indexes_fresh};

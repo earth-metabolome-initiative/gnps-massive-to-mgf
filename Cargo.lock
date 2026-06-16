@@ -773,6 +773,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "zenodo-rs 0.2.0",
  "zstd",
 ]
 
@@ -1301,7 +1302,7 @@ dependencies = [
  "smiles-parser",
  "thiserror",
  "ureq",
- "zenodo-rs",
+ "zenodo-rs 0.1.6",
  "zstd",
 ]
 
@@ -3148,6 +3149,33 @@ dependencies = [
  "mime",
  "mime_guess",
  "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "zenodo-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a2c07e482fad744d97619615ca7c8a3f52aab934ea9e3f91c0257fd198bb670"
+dependencies = [
+ "bytes",
+ "chrono",
+ "client-uploader-traits",
+ "futures-core",
+ "futures-util",
+ "indicatif",
+ "mime",
+ "mime_guess",
+ "reqwest",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
