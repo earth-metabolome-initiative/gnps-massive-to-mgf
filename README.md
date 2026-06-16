@@ -18,9 +18,13 @@ cargo run --release -- publish-dry-run
 cargo run --release -- publish
 ```
 
-`cargo run --release -- run` executes the same stages in order. Downloads use `DOWNLOAD_WORKERS` concurrent MassIVE transfers. Keep it at `1` for the initial production run, then raise it only after the restart behavior and network load look stable. MassIVE runs Apache `mod_qos` and rejects with `HTTP 429 Too Many Requests` once a per-IP threshold is hit; empirically `DOWNLOAD_WORKERS=16` triggers `429`s within the first batch, and `8` also produced `429`s clustered on a single dataset under sustained load. `4` is the current best-known sustained value.
+`cargo run --release -- run` executes the same stages in order. Downloads use anonymous FTPS against `massive-ftp.ucsd.edu`, which is the bulk-download endpoint MassIVE's administrators designate for public data. Files are retrieved one at a time. MassIVE fair-shares bandwidth across concurrent connections from the same IP and additionally throttles bursts (HTTPS via Apache `mod_qos`, FTPS via SFTPGo per-IP caps), so adding workers does not increase aggregate throughput and risks triggering an abuser cool-down that degrades all subsequent connections.
 
-Set `HTTP_REQUEST_TIMEOUT_SECONDS=0` to disable the full-transfer timeout for very large mzML files. The downloader retries failed files on the next run and resumes `.part` files when MassIVE accepts byte-range requests.
+The MassIVE FTPS server presents a self-signed certificate. The pipeline pins it via Trust-On-First-Use: the first connection records the cert's SHA-256 hash to `FTPS_CERT_PIN_PATH` (default `data/ftps_cert_pin.txt`) and every subsequent connection verifies the hash matches. If MassIVE rotates the cert, downloads will fail with a clear `pin mismatch` error; delete the pin file to re-trust the server.
+
+`source_files.volume` is populated from the dataset-level manifest at `MASSIVE_VOLUMES_PATH` during the `index` stage. Datasets absent from that manifest (typically new MSVs added after the manifest snapshot) cannot have their FTPS path constructed and fail fast at download time with a clear error.
+
+Set `FTPS_TRANSFER_TIMEOUT_SECONDS=0` to disable the full-transfer timeout for very large mzML files. The downloader retries failed files on the next run and resumes `.part` files via the FTP `REST` command when the server accepts it.
 
 For the first pilot, run the stages manually and inspect progress between them:
 

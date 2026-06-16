@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use chrono::Utc;
@@ -54,13 +55,12 @@ pub async fn download_openformats_indexes(
             config.openformats_index_dir.display()
         )
     })?;
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(config.http_connect_timeout)
-        .user_agent("gnps-massive-to-mgf/0.1");
-    if let Some(timeout) = config.http_request_timeout {
-        builder = builder.timeout(timeout);
-    }
-    let client = builder.build().context("failed to build HTTP client")?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_mins(10))
+        .user_agent("gnps-massive-to-mgf/0.1")
+        .build()
+        .context("failed to build HTTP client")?;
     let files_bar = progress.count_bar(2, "open-format index files")?;
 
     download_record_file(
@@ -857,6 +857,7 @@ mod tests {
         Config {
             openformats_record_id: 4_549_746,
             openformats_index_dir: root.join("openformats"),
+            massive_volumes_path: root.join("massive_volumes.tsv"),
             database_url: ":memory:".to_owned(),
             mzml_download_dir: root.join("mzml"),
             mgf_output_dir: root.to_path_buf(),
@@ -865,11 +866,13 @@ mod tests {
             mgf_shard_max_spectra: 1_000,
             source_selection_buffer: 1.25,
             source_selection_chunk_ms2: 50_000_000,
-            download_workers: 1,
             download_retry_attempts: 1,
             download_retry_delay: Duration::from_secs(0),
-            http_request_timeout: None,
-            http_connect_timeout: Duration::from_secs(1),
+            ftps_host: "127.0.0.1".to_owned(),
+            ftps_port: 21,
+            ftps_cert_pin_path: root.join("ftps_cert_pin.txt"),
+            ftps_connect_timeout: Duration::from_secs(1),
+            ftps_transfer_timeout: None,
             publish_to_zenodo: false,
             zenodo_deposition_id: None,
             zenodo_max_file_bytes: 50_000_000_000,

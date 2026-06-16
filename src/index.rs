@@ -172,7 +172,7 @@ pub fn ingest_openformats(
                 candidate_mzml = candidate_mzml.saturating_add(1);
                 SourceFileStatus::Candidate
             };
-            db.upsert_source_file(&record, &local_path, mzml_order, status)?;
+            db.upsert_source_file(&record, &local_path, mzml_order, status, None)?;
             mzml_order = mzml_order.saturating_add(1);
         }
         anyhow::Ok(())
@@ -186,6 +186,102 @@ pub fn ingest_openformats(
         candidate_mzml,
         skipped_unsupported,
         target_ms2_spectra,
+    })
+}
+
+/// Column index of `dataset_accession` in the MassIVE volumes manifest.
+const VOLUME_MANIFEST_DATASET_COLUMN: usize = 0;
+/// Column index of `volume` in the MassIVE volumes manifest.
+const VOLUME_MANIFEST_VOLUME_COLUMN: usize = 1;
+
+/// Summary returned after ingesting the dataset-level volume manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VolumeIngestReport {
+    /// Number of rows read from the TSV (including any skipped).
+    pub rows_read: u64,
+    /// Number of `source_files` rows whose `volume` actually changed.
+    pub rows_updated: u64,
+    /// Number of TSV rows skipped because they were blank or otherwise unusable.
+    pub rows_skipped: u64,
+    /// Number of indexed source files still lacking a volume after ingest.
+    pub missing_volume_after_ingest: u64,
+}
+
+/// Populates `source_files.volume` from the dataset-level volumes manifest.
+///
+/// The manifest is a tab-separated file with the columns
+/// `dataset_accession, volume, species, keywords` (the latter two are ignored
+/// by this function). It maps every MassIVE dataset accession to the FTPS
+/// volume bucket under which `massive-ftp.ucsd.edu` exposes it. The FTPS
+/// downloader uses this to construct absolute server paths.
+///
+/// The function is idempotent: rows whose `volume` already matches the
+/// manifest are reported as `rows_skipped`. After ingest,
+/// [`StateDb::count_missing_volume`] reports how many planned downloads still
+/// lack a mapping, surfaced via `missing_volume_after_ingest`.
+///
+/// # Errors
+///
+/// Returns an error if the TSV cannot be read, if a row fails to parse, or if
+/// `SQLite` rejects an update.
+pub fn ingest_volume_manifest(
+    db: &mut StateDb,
+    config: &Config,
+    progress: &ProgressReporter,
+) -> anyhow::Result<VolumeIngestReport> {
+    let path = &config.massive_volumes_path;
+    // Read as byte records rather than `deserialize`: the species and keyword
+    // columns occasionally contain Latin-1 byte sequences (e.g. `ó`, `á` in
+    // Brazilian place names) that crash the strict-UTF-8 deserializer. We only
+    // need the first two columns, both of which are guaranteed ASCII.
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    let rows = csv_row_count(path)?;
+    let bar = progress.row_bar(rows, "ingesting MassIVE volume manifest")?;
+    let mut rows_read = 0_u64;
+    let mut rows_updated = 0_u64;
+    let mut rows_skipped = 0_u64;
+
+    db.transaction(|db| {
+        let mut record = csv::ByteRecord::new();
+        while reader
+            .read_byte_record(&mut record)
+            .context("failed to read MassIVE volume-manifest row")?
+        {
+            bar.inc(1);
+            rows_read = rows_read.saturating_add(1);
+            let dataset_bytes = record.get(VOLUME_MANIFEST_DATASET_COLUMN).unwrap_or(&[]);
+            let volume_bytes = record.get(VOLUME_MANIFEST_VOLUME_COLUMN).unwrap_or(&[]);
+            let dataset = std::str::from_utf8(dataset_bytes)
+                .context("dataset_accession column is not valid UTF-8")?
+                .trim();
+            let volume = std::str::from_utf8(volume_bytes)
+                .context("volume column is not valid UTF-8")?
+                .trim();
+            if dataset.is_empty() || volume.is_empty() || volume == "volume" {
+                rows_skipped = rows_skipped.saturating_add(1);
+                continue;
+            }
+            let updated = db.update_dataset_volume(dataset, volume)?;
+            rows_updated = rows_updated.saturating_add(updated);
+        }
+        anyhow::Ok(())
+    })?;
+    let missing_volume_after_ingest = db.count_missing_volume()?;
+    bar.finish_with_message(format!(
+        "volume manifest ingested: {rows_updated} row(s) updated, {missing_volume_after_ingest} planned download(s) still missing a volume",
+    ));
+
+    Ok(VolumeIngestReport {
+        rows_read,
+        rows_updated,
+        rows_skipped,
+        missing_volume_after_ingest,
     })
 }
 
@@ -258,7 +354,7 @@ mod tests {
     use crate::db::StateDb;
     use crate::progress::ProgressReporter;
 
-    use super::{OpenFormatRecord, SourceFileStatus, ingest_openformats};
+    use super::{OpenFormatRecord, SourceFileStatus, ingest_openformats, ingest_volume_manifest};
 
     /// Confirms MassIVE download paths are rooted under the configured directory.
     #[test]
@@ -329,6 +425,69 @@ MSV000000001/a.mzML\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t6\tvendor
         Ok(())
     }
 
+    /// Confirms the volume manifest populates planned source files by dataset.
+    #[test]
+    fn ingest_volume_manifest_populates_existing_rows() -> anyhow::Result<()> {
+        let tempdir = tempdir()?;
+        write_massive_index(
+            tempdir.path(),
+            "\
+filepath\tdataset\tcollection\tcreate_time\tsize\tsize_mb\tspectra_ms1\tspectra_ms2\tinstrument_vendor\tinstrument_model\textension
+MSV000000001/a.mzML\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t6\tvendor\tmodel\t.mzML
+MSV000000002/b.mzML\tMSV000000002\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t5\tvendor\tmodel\t.mzML
+",
+        )?;
+        write_volume_manifest(
+            tempdir.path(),
+            "\
+dataset_accession\tvolume\tspecies\tkeywords
+MSV000000001\tv07\tHomo sapiens\tMetabolomics
+MSV000000002\tx01\tNULL\tNULL
+MSV000999999\tv01\tNULL\tNULL
+",
+        )?;
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+        let config = test_config(tempdir.path(), 100, 1.0);
+        ingest_openformats(&mut db, &config, &ProgressReporter::hidden())?;
+        let report = ingest_volume_manifest(&mut db, &config, &ProgressReporter::hidden())?;
+        assert_eq!(report.rows_read, 3);
+        assert_eq!(report.rows_updated, 2);
+        assert_eq!(report.rows_skipped, 0);
+        assert_eq!(report.missing_volume_after_ingest, 0);
+        Ok(())
+    }
+
+    /// Confirms repeated ingestion of the same manifest reports zero updates.
+    #[test]
+    fn ingest_volume_manifest_is_idempotent() -> anyhow::Result<()> {
+        let tempdir = tempdir()?;
+        write_massive_index(
+            tempdir.path(),
+            "\
+filepath\tdataset\tcollection\tcreate_time\tsize\tsize_mb\tspectra_ms1\tspectra_ms2\tinstrument_vendor\tinstrument_model\textension
+MSV000000001/a.mzML\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t6\tvendor\tmodel\t.mzML
+",
+        )?;
+        write_volume_manifest(
+            tempdir.path(),
+            "\
+dataset_accession\tvolume\tspecies\tkeywords
+MSV000000001\tv01\tNULL\tNULL
+",
+        )?;
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+        let config = test_config(tempdir.path(), 100, 1.0);
+        ingest_openformats(&mut db, &config, &ProgressReporter::hidden())?;
+        let first = ingest_volume_manifest(&mut db, &config, &ProgressReporter::hidden())?;
+        assert_eq!(first.rows_updated, 1);
+        let second = ingest_volume_manifest(&mut db, &config, &ProgressReporter::hidden())?;
+        assert_eq!(second.rows_updated, 0);
+        assert_eq!(second.missing_volume_after_ingest, 0);
+        Ok(())
+    }
+
     /// Writes a test MassIVE open-format TSV under the configured cache path.
     fn write_massive_index(root: &Path, contents: &str) -> anyhow::Result<()> {
         let index_dir = root.join("openformats");
@@ -337,11 +496,18 @@ MSV000000001/a.mzML\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t6\tvendor
         Ok(())
     }
 
+    /// Writes a test MassIVE volume manifest at the configured path.
+    fn write_volume_manifest(root: &Path, contents: &str) -> anyhow::Result<()> {
+        fs::write(root.join("massive_volumes.tsv"), contents)?;
+        Ok(())
+    }
+
     /// Builds a minimal test configuration rooted in a temporary directory.
     fn test_config(root: &Path, target_ms2_spectra: u64, source_selection_buffer: f64) -> Config {
         Config {
             openformats_record_id: 4_549_746,
             openformats_index_dir: root.join("openformats"),
+            massive_volumes_path: root.join("massive_volumes.tsv"),
             database_url: ":memory:".to_owned(),
             mzml_download_dir: root.join("mzml"),
             mgf_output_dir: root.join("mgf"),
@@ -350,11 +516,13 @@ MSV000000001/a.mzML\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t6\tvendor
             mgf_shard_max_spectra: 1_000,
             source_selection_buffer,
             source_selection_chunk_ms2: 50_000_000,
-            download_workers: 1,
             download_retry_attempts: 1,
             download_retry_delay: Duration::from_secs(0),
-            http_request_timeout: None,
-            http_connect_timeout: Duration::from_secs(1),
+            ftps_host: "127.0.0.1".to_owned(),
+            ftps_port: 21,
+            ftps_cert_pin_path: root.join("ftps_cert_pin.txt"),
+            ftps_connect_timeout: Duration::from_secs(1),
+            ftps_transfer_timeout: None,
             publish_to_zenodo: false,
             zenodo_deposition_id: None,
             zenodo_max_file_bytes: 50_000_000_000,

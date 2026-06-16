@@ -5,7 +5,7 @@ use anyhow::Context;
 use crate::config::Config;
 use crate::conversion::convert_downloaded_mzml;
 use crate::db::StateDb;
-use crate::index::ingest_openformats;
+use crate::index::{ingest_openformats, ingest_volume_manifest};
 use crate::massive::download_pending_mzml;
 use crate::progress::ProgressReporter;
 use crate::zenodo_publish::{download_openformats_indexes, publish_outputs_to_zenodo};
@@ -36,6 +36,8 @@ pub async fn run_pipeline(
         .await
         .context("failed to download open-format index files")?;
     ingest_openformats(db, config, progress).context("failed to ingest index")?;
+    ingest_volume_manifest(db, config, progress)
+        .context("failed to ingest MassIVE volume manifest")?;
     pipeline_bar.inc(1);
     let mut round = 1_u64;
     loop {

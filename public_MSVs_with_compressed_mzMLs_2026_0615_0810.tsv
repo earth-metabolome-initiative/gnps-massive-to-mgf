@@ -1,0 +1,52 @@
+dataset_accession	volume	species	keywords
+MSV000073595	v01	NULL	NULL
+MSV000077377	v01	NULL	NULL
+MSV000078983	v01	Homo sapiens	affinity-purification;AP-MS;FLAG
+MSV000079053	v01	Acidiphilium cryptum JF-5###Actinosynnema mirum DSM 43827###Anabaena variabilis###Anaeromyxobacter dehalogenans###Anaplasma phagocytophilum###Arthrobacter sp. FB24###Bacillus anthracis str. Ames###Bacillus anthracis str. Sterne###Bacillus subtilis subsp. subtilis str. 168###Bartonella henselae str. Houston-1###Borrelia burgdorferi B31###Brachybacterium faecium DSM 4810###Burkholderia mallei###Candidatus Chloracidobacterium thermophilum###Caulobacter crescentus CB15###Cellulomonas flavigena DSM 20109###Cenarchaeum symbiosum###Chlorobaculum tepidum###Chloroflexus aurantiacus###Clostridium thermocellum###Cryptobacterium curtum DSM 15641###Synechocystis sp. PCC 6803###Cyanothece sp. ATCC 51142###Cyanothece sp. ATCC 51472###Cyanothece sp. PCC 7424###Cyanothece sp. PCC 7425###Cyanothece sp. PCC 7822###Cyanothece sp. PCC 8801###Cyanothece sp. PCC 8802###Dehalococcoides ethenogenes 195###Deinococcus radiodurans R1###delta proteobacterium NaphS2###Desulfovibrio desulfuricans###Desulfovibrio desulfuricans ND132###Desulfovibrio vulgaris str. Hildenborough###Dethiosulfovibrio peptidovorans DSM 11002###Ehrlichia chaffeensis###Enterobacter cloacae SCF1###Escherichia coli BL21###Escherichia coli str. K-12 substr. MG1655###escherichia coli rk4353###Fibrobacter succinogenes subsp. succinogenes S85###Geobacter bemidjiensis Bem###Geobacter metallireducens GS-15###Geobacter sulfurreducens PCA###Geobacter uraniireducens###Haloferax volcanii###Halogeometricum borinquense DSM 11551###Halorhabdus utahensis DSM 12940###Heliobacterium modesticaldum###Kineococcus radiotolerans SRS30216###Kosmotoga olearia TBF 19.5.1###Methanosarcina barkeri###Methanospirillum hungatei JF-1###Methylophilales bacterium HTCC2181###Mycobacterium tuberculosis H37Rv###Nakamurella multipartita DSM 44233###Nocardiopsis dassonvillei subsp. dassonvillei DSM 43111###Novosphingobium aromaticivorans###Diplosphaera colitermitum TAV2###Candidatus Pelagibacter ubique HTCC1062###Pelobacter carbinolicus DSM 2380###Prochlorococcus marinus subsp. pastoris str. CCMP1986###Pseudomonas aeruginosa PAO1###Pseudomonas fluorescens Pf0-1###Pseudonocardia sp.###Ralstonia pickettii###Rhodobacter capsulatus SB 1003###Rhodobacter sphaeroides 2.4.1###Rhodopseudomonas palustris###Roseiflexus castenholzii###Saccharomonospora viridis DSM 43017###Salmonella enterica subsp. enterica serovar Typhi str. Ty2###Salmonella enterica subsp. enterica serovar Typhimurium str. 14028S###Salmonella enterica subsp. enterica serovar Typhimurium str. LT2###Sanguibacter keddieii DSM 10542###Shewanella amazonensis SB2B###Shewanella baltica OS155###Shewanella baltica OS185###Shewanella baltica OS195###Shewanella baltica OS223###Shewanella denitrificans OS217###Shewanella frigidimarina NCIMB 400###Shewanella loihica PV-4###Shewanella oneidensis MR-1###Shewanella putrefaciens 200###Shewanella putrefaciens CN-32###Shewanella sp. W3-18-1###Shewanella sp. ANA-3###Shewanella sp. MR-4###Shewanella sp. MR-7###Sinorhizobium medicae###Sinorhizobium meliloti 1021###Slackia heliotrinireducens DSM 20476###Stackebrandtia nassauensis DSM 44728###Sulfolobus acidocaldarius DSM 639###Synechococcus sp. PCC 7002###Syntrophobacter fumaroxidans###Thermobispora bispora DSM 43833###Thermosynechococcus elongatus BP-1###Thermosynechococcus sp. NK55a###Thermotoga maritima###Thiocapsa marina###Opitutaceae bacterium TAV1###Opitutaceae bacterium TAV5###Xylanimonas cellulosilytica DSM 15894###Yersinia enterocolitica###Yersinia pestis CO92###Yersinia pestis KIM10+###Yersinia pseudotuberculosis IP 32953###Yersinia pseudotuberculosis PB1/+	Biodiversity Library data from microbes
+MSV000079404	v01	Mus musculus	Cortex;MPLEx
+MSV000079405	v01	Arabidopsis thaliana	MPLEx
+MSV000079406	v01	Homo sapiens	MPLEx
+MSV000079407	v01	Homo sapiens	MPLEx;Urine
+MSV000079408	v01	Cyanobacteria	MPLEx;microbial community
+MSV000079409	v01	Shewanella oneidensis MR-1	MPLEx
+MSV000079410	v01	Sulfolobus acidocaldarius	MPLEx
+MSV000079811	v01	Saccharomyces cerevisiae###Homo sapiens###BSA	Quantification;Bioinformatics;Covariation
+MSV000079852	v01	Homo sapiens	CPTAC
+MSV000079878	v01	environmental samples <Bacillariophyta>	Microbial;Metaproteomics;Marine
+MSV000080147	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080148	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080149	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080150	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080151	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080152	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080153	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080154	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080155	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080156	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080157	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080158	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080159	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080160	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080161	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080162	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080163	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080165	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080168	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080169	x01	Homo sapiens	CPTAC CPTAC-TCGA_Colorectal_Cancer CPTAC-VU
+MSV000080921	v01	Homo sapiens	Colon;CPTAC
+MSV000080971	v01	Streptococcus pyogenes serotype M1	Streptococcus pyogenes, proteome, subcellular, fractionation 
+MSV000082214	v01	Yersinia phage phiR201	phiR201, Yersinia enterocolitica
+MSV000082215	v01	Yersinia phage phiR201	phiR201, Yersinia enterocolitica
+MSV000082648	v02	Homo sapiens	HLA, Machine Learning
+MSV000082875	v02	Homo sapiens	CPTAC
+MSV000082982	v02	Streptococcus pyogenes serotype M1	M1_Fib cross linking data;M1_alb cross linking data;M1_plasma cross linking data
+MSV000083150	x01	[Cellvibrio] gilvus ATCC 13127###Shewanella oneidensis MR-1###Francisella novicida U112###Cyanobacterium stanieri###Prevotella ruminicola 23###Faecalibacterium prausnitzii SL3/3###Campylobacter jejuni###Pseudomonas putida KT2440###NCBITaxon:1348584###Bacillus subtilis subsp. subtilis str. 168###Legionella pneumophila###Streptomyces sp.###Dorea formicigenerans###Cupriavidus necator N-1###Sulfobacillus thermosulfidooxidans###Alcaligenes faecalis###Bacillus subtilis subsp. subtilis str. NCIB 3610###Methylomicrobium alcaliphilum 20Z###Paracoccus denitrificans###Rhodococcus jostii RHA1###Mycobacterium smegmatis###Paenibacillus polymyxa ATCC 842###Acidiphilium cryptum JF-5###NCBITaxon:1666912###Bacillus cereus ATCC 14579###Bacteroides thetaiotaomicron VPI-5482###Lactobacillus casei subsp. casei ATCC 393###NCBITaxon:1486246###Streptomyces griseorubens###NCBITaxon:1798193###Micrococcus luteus###Stigmatella aurantiaca DW4/3-1###Anaerococcus hydrogenalis DSM 7454###Citrobacter freundii###Myxococcus xanthus DZ2###Rhodopseudomonas palustris###Chryseobacterium indologenes###Bacteroides fragilis 638R###Bifidobacterium bifidum DSM 20456 = JCM 1255###Coprococcus comes ATCC 27758###Listeria monocytogenes 10403S###Ruminococcus gnavus ATCC 29149###Bifidobacterium longum subsp. infantis ATCC 15697 = JCM 1222###Streptococcus agalactiae###Fibrobacter succinogenes subsp. succinogenes S85###Synechococcus elongatus PCC 7942###Clostridium ljungdahlii DSM 13528###Delftia acidovorans SPH-1###Agrobacterium tumefaciens###NCBITaxon:1305737	machine learning; deep learning; bacterial diversity
+MSV000083163	v02	Mus musculus	lung;club cell;COPD;lipoprotein receptor;LRP1;oxidation
+MSV000088849	v04	Homo sapiens (NCBITaxon:9606)	human plasma;liquid chromatography;ion mobility spectrometry;tandem mass spectrometry
+MSV000089499	v04	Vibrio sp. 1A01 (NCBITaxon:314742)	Chitin degradation
+MSV000091746	v05	Homo sapiens (NCBITaxon:9606)	liquid chromatography;ion mobility spectrometry;tandem mass spectrometry;human plasma
+MSV000095426	v08	Homo sapiens (NCBITaxon:9606)	dia-PASEF;dda-PASEF
+MSV000095531	v08	Not applicable	internal standards;isotope labeled;liquid chromatography;ion mobility spectrometry;tandem mass spectrometry
+MSV000097080	v09	Gallus gallus (NCBITaxon:9031)	ILTV;GaHV-1;infectious laryngotracheitis virus;Gallid alphaherpesvirus 1;proteogenomics;DatasetType:Proteomics
+MSV000099226	v10	Coffea arabica (NCBITaxon:13443)	metabolomica;coffea arabica;Cromatografia;DatasetType:Metabolomics
+MSV000100122	v11	Mus musculus (NCBITaxon:10090)	mass spec imaging, lipids;DatasetType:Other (Mass spec imaging);LC-MS metabolomics

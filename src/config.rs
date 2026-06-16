@@ -10,6 +10,8 @@ use anyhow::{Context, bail};
 const DEFAULT_OPENFORMATS_RECORD_ID: u64 = 4_549_746;
 /// Default directory for cached index TSV files.
 const DEFAULT_INDEX_DIR: &str = "data/openformats";
+/// Default dataset-level manifest mapping MSV accessions to FTPS volume buckets.
+const DEFAULT_MASSIVE_VOLUMES_PATH: &str = "public_MSVs_2026_0615_0812.tsv";
 /// Default SQLite state database.
 const DEFAULT_DATABASE_URL: &str = "data/gnps_massive_to_mgf.sqlite";
 /// Default raw mzML download directory.
@@ -22,16 +24,20 @@ const DEFAULT_TARGET_MS2_SPECTRA: u64 = 200_000_000;
 const DEFAULT_TOP_K_PEAKS: usize = 256;
 /// Default number of spectra written per compressed MGF shard.
 const DEFAULT_MGF_SHARD_MAX_SPECTRA: u64 = 1_000_000;
-/// Default concurrent MassIVE download worker count.
-const DEFAULT_DOWNLOAD_WORKERS: usize = 1;
 /// Default number of retry attempts for a source file download.
 const DEFAULT_DOWNLOAD_RETRY_ATTEMPTS: usize = 5;
 /// Default delay between retryable download failures.
 const DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS: u64 = 30;
-/// Default overall HTTP request timeout.
-const DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 600;
-/// Default HTTP connect timeout.
-const DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+/// Default FTPS host for MassIVE bulk downloads.
+const DEFAULT_FTPS_HOST: &str = "massive-ftp.ucsd.edu";
+/// Default FTPS control-channel port.
+const DEFAULT_FTPS_PORT: u16 = 21;
+/// Default path the TOFU cert pin is persisted at.
+const DEFAULT_FTPS_CERT_PIN_PATH: &str = "data/ftps_cert_pin.txt";
+/// Default FTPS connect timeout.
+const DEFAULT_FTPS_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+/// Default FTPS transfer (per-file) timeout.
+const DEFAULT_FTPS_TRANSFER_TIMEOUT_SECONDS: u64 = 600;
 /// Default source selection buffer over the requested final unique target.
 const DEFAULT_SOURCE_SELECTION_BUFFER: f64 = 1.25;
 /// Default extra indexed MS/MS spectra promoted when the unique target is short.
@@ -47,6 +53,13 @@ pub struct Config {
     pub openformats_record_id: u64,
     /// Directory where the index TSV files are cached.
     pub openformats_index_dir: PathBuf,
+    /// Path to the dataset-level manifest mapping MSV accessions to FTPS
+    /// volume buckets (e.g. `v01`, `x01`).
+    ///
+    /// Consumed by [`crate::index::ingest_volume_manifest`] to populate
+    /// `source_files.volume`, which the FTPS downloader needs to construct
+    /// absolute server paths under `massive-ftp.ucsd.edu`.
+    pub massive_volumes_path: PathBuf,
     /// SQLite state database URL/path.
     pub database_url: String,
     /// Directory where raw mzML files are downloaded.
@@ -63,16 +76,20 @@ pub struct Config {
     pub source_selection_buffer: f64,
     /// Indexed MS/MS spectra promoted when converted unique spectra are short.
     pub source_selection_chunk_ms2: u64,
-    /// Concurrent source-file download worker count.
-    pub download_workers: usize,
     /// Number of retry attempts for each source-file download.
     pub download_retry_attempts: usize,
     /// Delay between retryable download attempts.
     pub download_retry_delay: Duration,
-    /// HTTP request timeout; `None` disables the full-transfer timeout.
-    pub http_request_timeout: Option<Duration>,
-    /// HTTP connect timeout.
-    pub http_connect_timeout: Duration,
+    /// FTPS host for MassIVE bulk downloads.
+    pub ftps_host: String,
+    /// FTPS control-channel port.
+    pub ftps_port: u16,
+    /// Path the TOFU cert pin is persisted at; see [`crate::ftps_tofu`].
+    pub ftps_cert_pin_path: PathBuf,
+    /// FTPS connect timeout.
+    pub ftps_connect_timeout: Duration,
+    /// FTPS per-file transfer timeout; `None` disables it.
+    pub ftps_transfer_timeout: Option<Duration>,
     /// Whether production Zenodo publication should run.
     pub publish_to_zenodo: bool,
     /// Existing production Zenodo deposition id, when configured.
@@ -96,14 +113,14 @@ impl Config {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all knobs are individually trivial and grouped here on purpose; \
+                  splitting into per-section helpers would add indirection without clarity"
+    )]
     fn from_env_reader(
         read_env: &impl Fn(&str) -> anyhow::Result<Option<String>>,
     ) -> anyhow::Result<Self> {
-        let download_workers = parse_usize(read_env, "DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)?;
-        if download_workers == 0 {
-            bail!("DOWNLOAD_WORKERS must be positive");
-        }
-
         let download_retry_attempts = parse_usize(
             read_env,
             "DOWNLOAD_RETRY_ATTEMPTS",
@@ -154,11 +171,17 @@ impl Config {
             bail!("ZENODO_MAX_FILE_BYTES must be positive");
         }
 
-        let http_request_timeout_seconds = parse_u64(
+        let ftps_transfer_timeout_seconds = parse_u64(
             read_env,
-            "HTTP_REQUEST_TIMEOUT_SECONDS",
-            DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS,
+            "FTPS_TRANSFER_TIMEOUT_SECONDS",
+            DEFAULT_FTPS_TRANSFER_TIMEOUT_SECONDS,
         )?;
+        let ftps_port_value = parse_u64(read_env, "FTPS_PORT", u64::from(DEFAULT_FTPS_PORT))?;
+        let ftps_port = u16::try_from(ftps_port_value)
+            .with_context(|| format!("FTPS_PORT {ftps_port_value} does not fit u16"))?;
+        if ftps_port == 0 {
+            bail!("FTPS_PORT must be positive");
+        }
 
         Ok(Self {
             openformats_record_id: parse_u64(
@@ -170,6 +193,11 @@ impl Config {
                 read_env,
                 "OPENFORMATS_INDEX_DIR",
                 DEFAULT_INDEX_DIR,
+            )?,
+            massive_volumes_path: parse_path(
+                read_env,
+                "MASSIVE_VOLUMES_PATH",
+                DEFAULT_MASSIVE_VOLUMES_PATH,
             )?,
             database_url: parse_string(read_env, "STATE_DATABASE_URL", DEFAULT_DATABASE_URL)?,
             mzml_download_dir: parse_path(
@@ -187,20 +215,26 @@ impl Config {
             mgf_shard_max_spectra,
             source_selection_buffer,
             source_selection_chunk_ms2,
-            download_workers,
             download_retry_attempts,
             download_retry_delay: Duration::from_secs(parse_u64(
                 read_env,
                 "DOWNLOAD_RETRY_DELAY_SECONDS",
                 DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS,
             )?),
-            http_request_timeout: (http_request_timeout_seconds > 0)
-                .then(|| Duration::from_secs(http_request_timeout_seconds)),
-            http_connect_timeout: Duration::from_secs(parse_u64(
+            ftps_host: parse_string(read_env, "FTPS_HOST", DEFAULT_FTPS_HOST)?,
+            ftps_port,
+            ftps_cert_pin_path: parse_path(
                 read_env,
-                "HTTP_CONNECT_TIMEOUT_SECONDS",
-                DEFAULT_HTTP_CONNECT_TIMEOUT_SECONDS,
+                "FTPS_CERT_PIN_PATH",
+                DEFAULT_FTPS_CERT_PIN_PATH,
+            )?,
+            ftps_connect_timeout: Duration::from_secs(parse_u64(
+                read_env,
+                "FTPS_CONNECT_TIMEOUT_SECONDS",
+                DEFAULT_FTPS_CONNECT_TIMEOUT_SECONDS,
             )?),
+            ftps_transfer_timeout: (ftps_transfer_timeout_seconds > 0)
+                .then(|| Duration::from_secs(ftps_transfer_timeout_seconds)),
             publish_to_zenodo: env_present(read_env, "ZENODO_TOKEN")?,
             zenodo_deposition_id: parse_optional_u64(read_env, "ZENODO_DEPOSITION_ID")?,
             zenodo_max_file_bytes,
@@ -337,18 +371,28 @@ mod tests {
         let config = config_from_pairs(&[])?;
         assert_eq!(config.mzml_download_dir, PathBuf::from("/mnt/bfd/mzml"));
         assert_eq!(config.mgf_output_dir, PathBuf::from("/mnt/bfd/mgf"));
+        assert_eq!(
+            config.massive_volumes_path,
+            PathBuf::from("public_MSVs_2026_0615_0812.tsv"),
+        );
         assert_eq!(config.target_ms2_spectra, 200_000_000);
         assert_eq!(config.top_k_peaks, 256);
-        assert_eq!(config.http_request_timeout, Some(Duration::from_mins(10)));
+        assert_eq!(config.ftps_host, "massive-ftp.ucsd.edu");
+        assert_eq!(config.ftps_port, 21);
+        assert_eq!(
+            config.ftps_cert_pin_path,
+            PathBuf::from("data/ftps_cert_pin.txt"),
+        );
+        assert_eq!(config.ftps_transfer_timeout, Some(Duration::from_mins(10)));
         assert!(!config.publish_to_zenodo);
         Ok(())
     }
 
-    /// Confirms zero disables the full-transfer HTTP request timeout.
+    /// Confirms zero disables the full-transfer FTPS timeout.
     #[test]
-    fn zero_request_timeout_disables_full_transfer_timeout() -> anyhow::Result<()> {
-        let config = config_from_pairs(&[("HTTP_REQUEST_TIMEOUT_SECONDS", "0")])?;
-        assert_eq!(config.http_request_timeout, None);
+    fn zero_transfer_timeout_disables_full_transfer_timeout() -> anyhow::Result<()> {
+        let config = config_from_pairs(&[("FTPS_TRANSFER_TIMEOUT_SECONDS", "0")])?;
+        assert_eq!(config.ftps_transfer_timeout, None);
         Ok(())
     }
 

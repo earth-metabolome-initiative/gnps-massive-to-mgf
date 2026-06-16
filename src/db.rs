@@ -57,6 +57,15 @@ pub struct SourceFileRow {
     /// Current status.
     #[diesel(sql_type = Text)]
     pub status: String,
+    /// FTPS volume bucket (e.g. `v01`, `x01`) for `massive-ftp.ucsd.edu`.
+    ///
+    /// Populated from the dataset-level manifest at
+    /// [`Config::massive_volumes_path`](crate::config::Config::massive_volumes_path)
+    /// by [`ingest_volume_manifest`](crate::index::ingest_volume_manifest).
+    /// `None` when no mapping is available; the FTPS downloader refuses such
+    /// rows rather than fall back to HTTPS.
+    #[diesel(sql_type = Nullable<Text>)]
+    pub volume: Option<String>,
 }
 
 impl SourceFileRow {
@@ -207,10 +216,13 @@ CREATE TABLE IF NOT EXISTS source_files (
     msn_counts_json TEXT NOT NULL DEFAULT '{}',
     converted_spectra INTEGER NOT NULL DEFAULT 0,
     converted_top_k INTEGER,
+    volume TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS source_files_status_order_idx
     ON source_files(status, selected_order);
+CREATE INDEX IF NOT EXISTS source_files_dataset_idx
+    ON source_files(dataset);
 CREATE TABLE IF NOT EXISTS spectra_seen (
     top_k_peaks INTEGER NOT NULL,
     splash TEXT NOT NULL,
@@ -253,7 +265,10 @@ CREATE INDEX IF NOT EXISTS source_file_conversions_status_idx
     ON source_file_conversions(top_k_peaks, status);
 ",
             )
-            .context("failed to initialize state schema")
+            .context("failed to initialize state schema")?;
+        add_volume_column_if_missing(&mut self.connection)
+            .context("failed to migrate source_files schema for volume column")?;
+        Ok(())
     }
 
     /// Runs a closure inside a simple immediate transaction.
@@ -286,6 +301,12 @@ CREATE INDEX IF NOT EXISTS source_file_conversions_status_idx
 
     /// Inserts or refreshes one selected source file.
     ///
+    /// The `volume` argument is the FTPS volume bucket for the file. Pass
+    /// `None` when ingesting the file-level open-format index; the value is
+    /// preserved across re-ingests via `COALESCE`, so an existing volume is
+    /// not clobbered. Volumes are typically filled by
+    /// [`Self::update_dataset_volume`] from a separate dataset-level manifest.
+    ///
     /// # Errors
     ///
     /// Returns an error if SQLite rejects the row.
@@ -295,6 +316,7 @@ CREATE INDEX IF NOT EXISTS source_file_conversions_status_idx
         local_path: &Path,
         selected_order: u64,
         status: SourceFileStatus,
+        volume: Option<&str>,
     ) -> anyhow::Result<()> {
         let size = i64::try_from(record.size).context("source size does not fit i64")?;
         let size_mb = i64::try_from(record.size_mb).context("source size_mb does not fit i64")?;
@@ -306,8 +328,8 @@ CREATE INDEX IF NOT EXISTS source_file_conversions_status_idx
 INSERT INTO source_files (
     filepath, dataset, collection, create_time, size_bytes, size_mb,
     spectra_ms1, spectra_ms2, instrument_vendor, instrument_model, extension,
-    local_path, selected_order, status
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    local_path, selected_order, status, volume
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(filepath) DO UPDATE SET
     dataset = excluded.dataset,
     collection = excluded.collection,
@@ -325,6 +347,7 @@ ON CONFLICT(filepath) DO UPDATE SET
         WHEN source_files.status IN ('downloaded', 'converted') THEN source_files.status
         ELSE excluded.status
     END,
+    volume = COALESCE(excluded.volume, source_files.volume),
     updated_at = CURRENT_TIMESTAMP
 ",
         )
@@ -342,6 +365,7 @@ ON CONFLICT(filepath) DO UPDATE SET
         .bind::<Text, _>(&local_path)
         .bind::<BigInt, _>(selected_order)
         .bind::<Text, _>(status.as_str())
+        .bind::<Nullable<Text>, _>(volume)
         .execute(&mut self.connection)
         .context("failed to upsert source file")?;
         Ok(())
@@ -357,7 +381,8 @@ ON CONFLICT(filepath) DO UPDATE SET
         sql_query(
             "\
 SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
-       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status
+       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
+       volume
 FROM source_files
 WHERE status = 'indexed'
 ORDER BY selected_order
@@ -459,6 +484,63 @@ WHERE status = 'download_failed'
         u64::try_from(updated).context("reset count does not fit u64")
     }
 
+    /// Updates the FTPS volume bucket for every row of a dataset accession.
+    ///
+    /// Returns the number of rows whose `volume` actually changed. Rows whose
+    /// existing volume already matches the requested value are skipped, so
+    /// repeated ingestion of the same manifest reports zero updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the update.
+    pub fn update_dataset_volume(&mut self, dataset: &str, volume: &str) -> anyhow::Result<u64> {
+        let updated = sql_query(
+            "\
+UPDATE source_files
+SET volume = ?, updated_at = CURRENT_TIMESTAMP
+WHERE dataset = ? AND (volume IS NULL OR volume <> ?)
+",
+        )
+        .bind::<Text, _>(volume)
+        .bind::<Text, _>(dataset)
+        .bind::<Text, _>(volume)
+        .execute(&mut self.connection)
+        .with_context(|| format!("failed to set volume {volume} for dataset {dataset}"))?;
+        u64::try_from(updated).context("volume update count does not fit u64")
+    }
+
+    /// Counts source files in the planned download workload that lack a volume.
+    ///
+    /// The planned set is the same one used by
+    /// [`Self::download_progress_totals`]: rows in `downloaded`, `indexed`, or
+    /// `download_failed` status. The FTPS downloader uses this to fail fast
+    /// before opening a connection, since a row with no volume cannot have its
+    /// FTPS URL constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SQLite` rejects the query.
+    pub fn count_missing_volume(&mut self) -> anyhow::Result<u64> {
+        #[derive(QueryableByName)]
+        struct CountRow {
+            /// Number of rows lacking a volume.
+            #[diesel(sql_type = BigInt)]
+            count: i64,
+        }
+
+        let row = sql_query(
+            "\
+SELECT COUNT(*) AS count
+FROM source_files
+WHERE volume IS NULL
+  AND status IN ('downloaded', 'indexed', 'download_failed')
+",
+        )
+        .get_result::<CountRow>(&mut self.connection)
+        .context("failed to count source files missing a volume")?;
+        i64_to_u64(row.count, "missing-volume count")
+    }
+
     /// Returns downloaded source files pending conversion.
     ///
     /// # Errors
@@ -474,7 +556,8 @@ WHERE status = 'download_failed'
         sql_query(
             "\
 SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
-       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status
+       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
+       volume
 FROM source_files
 WHERE status = 'downloaded'
   AND NOT EXISTS (
@@ -1018,7 +1101,8 @@ WHERE top_k_peaks = ? AND status = 'failed'
         let candidates = sql_query(
             "\
 SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
-       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status
+       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
+       volume
 FROM source_files
 WHERE status = 'candidate'
 ORDER BY selected_order
@@ -1101,6 +1185,32 @@ fn f64_to_u64(value: f64) -> Option<u64> {
     text.parse::<u64>().ok()
 }
 
+/// Adds the `volume` column to `source_files` if it does not already exist.
+///
+/// `volume` was added after the initial schema shipped, so existing databases
+/// need an idempotent `ALTER TABLE` to pick it up. New databases get the
+/// column directly via the `CREATE TABLE` in [`StateDb::initialize`].
+fn add_volume_column_if_missing(connection: &mut SqliteConnection) -> anyhow::Result<()> {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        /// Number of existing columns named `volume` (0 or 1).
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    let row = sql_query(
+        "SELECT COUNT(*) AS count FROM pragma_table_info('source_files') WHERE name = 'volume'",
+    )
+    .get_result::<CountRow>(connection)
+    .context("failed to inspect source_files columns")?;
+    if row.count == 0 {
+        connection
+            .batch_execute("ALTER TABLE source_files ADD COLUMN volume TEXT")
+            .context("failed to add volume column to source_files")?;
+    }
+    Ok(())
+}
+
 /// Creates the parent directory for a SQLite path when needed.
 fn create_sqlite_parent(database_url: &str) -> anyhow::Result<()> {
     if database_url == ":memory:" || database_url.starts_with("file:") {
@@ -1152,6 +1262,106 @@ mod tests {
         Ok(())
     }
 
+    /// Confirms the volume column is added to a pre-migration `source_files` table.
+    #[test]
+    fn adds_volume_column_to_legacy_schema() -> anyhow::Result<()> {
+        let mut db = StateDb::connect(":memory:")?;
+        // Recreate the schema as it shipped before `volume` existed and run
+        // `initialize` against it; the migration must add the column.
+        diesel::sql_query(
+            "CREATE TABLE source_files (
+                filepath TEXT PRIMARY KEY NOT NULL,
+                dataset TEXT NOT NULL,
+                collection TEXT NOT NULL,
+                create_time TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                size_mb INTEGER NOT NULL,
+                spectra_ms1 REAL,
+                spectra_ms2 REAL,
+                instrument_vendor TEXT NOT NULL,
+                instrument_model TEXT NOT NULL,
+                extension TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                selected_order INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                downloaded_bytes INTEGER,
+                ms1_count INTEGER NOT NULL DEFAULT 0,
+                ms2_count INTEGER NOT NULL DEFAULT 0,
+                msn_counts_json TEXT NOT NULL DEFAULT '{}',
+                converted_spectra INTEGER NOT NULL DEFAULT 0,
+                converted_top_k INTEGER,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&mut db.connection)?;
+        db.initialize()?;
+        assert!(volume_column_exists(&mut db)?);
+        Ok(())
+    }
+
+    /// Confirms `initialize` can be called twice without error after the migration.
+    #[test]
+    fn initialize_is_idempotent_with_volume_column() -> anyhow::Result<()> {
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+        db.initialize()?;
+        assert!(volume_column_exists(&mut db)?);
+        Ok(())
+    }
+
+    /// Confirms volume updates target only the matching dataset accession.
+    #[test]
+    fn update_dataset_volume_updates_only_matching_rows() -> anyhow::Result<()> {
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+        let one = test_record("MSV000000001/path/file.mzML", 1.0);
+        let two = test_record_for_dataset("MSV000000002/path/file.mzML", "MSV000000002", 1.0, 1);
+        db.upsert_source_file(
+            &one,
+            Path::new("/tmp/a.mzML"),
+            0,
+            SourceFileStatus::Indexed,
+            None,
+        )?;
+        db.upsert_source_file(
+            &two,
+            Path::new("/tmp/b.mzML"),
+            1,
+            SourceFileStatus::Indexed,
+            None,
+        )?;
+        // First update sets a volume only on the matching row.
+        assert_eq!(db.update_dataset_volume("MSV000000001", "v07")?, 1);
+        // A second identical update is a no-op (excluded by the `<>` guard).
+        assert_eq!(db.update_dataset_volume("MSV000000001", "v07")?, 0);
+        // The second dataset still has a NULL volume.
+        let row = db
+            .pending_downloads(10)?
+            .into_iter()
+            .find(|row| row.dataset == "MSV000000002")
+            .ok_or_else(|| anyhow::anyhow!("expected pending row for second dataset"))?;
+        assert_eq!(row.volume, None);
+        // Only the second dataset still lacks a volume in the planned set.
+        assert_eq!(db.count_missing_volume()?, 1);
+        Ok(())
+    }
+
+    /// Returns whether the `volume` column is present on `source_files`.
+    fn volume_column_exists(db: &mut StateDb) -> anyhow::Result<bool> {
+        #[derive(QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = BigInt)]
+            count: i64,
+        }
+
+        let row = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pragma_table_info('source_files') WHERE name = 'volume'",
+        )
+        .get_result::<CountRow>(&mut db.connection)?;
+        Ok(row.count == 1)
+    }
+
     /// Confirms download progress totals fold completed and pending work together.
     #[test]
     fn download_progress_totals_combine_completed_and_pending() -> anyhow::Result<()> {
@@ -1167,24 +1377,28 @@ mod tests {
             Path::new("/tmp/done.mzML"),
             0,
             SourceFileStatus::Downloaded,
+            None,
         )?;
         db.upsert_source_file(
             &pending_record,
             Path::new("/tmp/pending.mzML"),
             1,
             SourceFileStatus::Indexed,
+            None,
         )?;
         db.upsert_source_file(
             &failed_record,
             Path::new("/tmp/failed.mzML"),
             2,
             SourceFileStatus::DownloadFailed,
+            None,
         )?;
         db.upsert_source_file(
             &candidate_record,
             Path::new("/tmp/candidate.mzML"),
             3,
             SourceFileStatus::Candidate,
+            None,
         )?;
         let totals = db.download_progress_totals()?;
         assert_eq!(totals.planned_files, 3);
@@ -1205,6 +1419,7 @@ mod tests {
             Path::new("/tmp/file.mzML"),
             0,
             SourceFileStatus::Candidate,
+            None,
         )?;
         assert_eq!(db.count_status(SourceFileStatus::Candidate)?, 1);
         assert_eq!(db.promote_candidates_by_ms2(1)?, 1);
@@ -1223,6 +1438,7 @@ mod tests {
             Path::new("/tmp/file.mzML"),
             0,
             SourceFileStatus::Downloaded,
+            None,
         )?;
         assert_eq!(db.downloaded_unconverted(256, 10)?.len(), 1);
         db.mark_conversion_failed(&record.filepath, 256, "bad mzML")?;
@@ -1288,5 +1504,17 @@ mod tests {
             instrument_model: "model".to_owned(),
             extension: ".mzML".to_owned(),
         }
+    }
+
+    /// Builds a small test open-format record with a custom dataset accession.
+    fn test_record_for_dataset(
+        filepath: &str,
+        dataset: &str,
+        spectra_ms2: f64,
+        size: u64,
+    ) -> OpenFormatRecord {
+        let mut record = test_record_with_size(filepath, spectra_ms2, size);
+        record.dataset = dataset.to_owned();
+        record
     }
 }

@@ -3,8 +3,8 @@
 use anyhow::{Context, bail};
 use gnps_massive_to_mgf::{
     Config, ProgressReporter, StateDb, collect_pipeline_status, convert_downloaded_mzml,
-    download_openformats_indexes, download_pending_mzml, ingest_openformats, publication_dry_run,
-    publish_outputs_to_zenodo, run_pipeline,
+    download_openformats_indexes, download_pending_mzml, ingest_openformats,
+    ingest_volume_manifest, publication_dry_run, publish_outputs_to_zenodo, run_pipeline,
 };
 
 /// Runs the requested pipeline subcommand.
@@ -27,6 +27,14 @@ async fn main() -> anyhow::Result<()> {
             progress.println(format!(
                 "indexed MassIVE mzML files: {} queued, {} candidates, {} indexed MS/MS spectra",
                 report.inserted_mzml, report.candidate_mzml, report.target_ms2_spectra
+            ))?;
+            let volume_report = ingest_volume_manifest(&mut db, &config, &progress)
+                .context("failed to ingest MassIVE volume manifest")?;
+            progress.println(format!(
+                "ingested MassIVE volume manifest: {} updated, {} skipped, {} planned download(s) still missing a volume",
+                volume_report.rows_updated,
+                volume_report.rows_skipped,
+                volume_report.missing_volume_after_ingest
             ))?;
         }
         Some("download") => {

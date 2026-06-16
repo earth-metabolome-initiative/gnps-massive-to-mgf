@@ -9,6 +9,8 @@ pub mod config;
 pub mod conversion;
 /// SQLite state store backed by Diesel.
 pub mod db;
+/// Trust-On-First-Use cert verifier for FTPS connections.
+pub mod ftps_tofu;
 /// Open-format index ingestion and row models.
 pub mod index;
 /// MassIVE file download helpers.
@@ -25,7 +27,10 @@ pub mod zenodo_publish;
 pub use config::Config;
 pub use conversion::{ConversionSummary, convert_downloaded_mzml};
 pub use db::{DownloadProgressTotals, StateDb};
-pub use index::{OpenFormatRecord, SourceFileStatus, ingest_openformats};
+pub use index::{
+    OpenFormatRecord, SourceFileStatus, VolumeIngestReport, ingest_openformats,
+    ingest_volume_manifest,
+};
 pub use massive::download_pending_mzml;
 pub use pipeline::{PipelineDecision, decide_next_pipeline_step, run_pipeline};
 pub use progress::ProgressReporter;
