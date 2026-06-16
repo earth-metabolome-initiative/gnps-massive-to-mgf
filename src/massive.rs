@@ -26,7 +26,7 @@ use suppaftp::types::FileType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::Config;
-use crate::db::{SourceFileRow, StateDb};
+use crate::db::{DownloadFilter, SourceFileRow, StateDb};
 use crate::ftps_tofu::{TofuCertVerifier, rustls_config};
 use crate::index::SourceFileStatus;
 use crate::progress_sink::{ProgressEvent, ProgressSink};
@@ -100,7 +100,9 @@ impl FtpsDownloadBackend {
 /// Files are downloaded sequentially via anonymous FTPS. Each file is written
 /// to a `.part` path first, byte-count validated, then atomically renamed.
 /// Failed files are retried up to `Config::download_retry_attempts` times with
-/// `Config::download_retry_delay` between attempts.
+/// `Config::download_retry_delay` between attempts. `filter` restricts which
+/// indexed rows are pulled from the database; pass `&DownloadFilter::default()`
+/// to download every queued file.
 ///
 /// # Errors
 ///
@@ -109,9 +111,10 @@ pub async fn download_pending_mzml(
     db: &mut StateDb,
     config: &Config,
     sink: &ProgressSink,
+    filter: &DownloadFilter,
 ) -> anyhow::Result<()> {
     let backend = FtpsDownloadBackend::from_config(config)?;
-    download_pending_mzml_with_backend(db, config, sink, backend).await
+    download_pending_mzml_with_backend(db, config, sink, backend, filter).await
 }
 
 /// Downloads pending mzML files using the supplied FTPS backend.
@@ -128,6 +131,7 @@ pub async fn download_pending_mzml_with_backend(
     config: &Config,
     sink: &ProgressSink,
     backend: FtpsDownloadBackend,
+    filter: &DownloadFilter,
 ) -> anyhow::Result<()> {
     let reset = db.reset_download_failures()?;
     if reset > 0 {
@@ -153,7 +157,7 @@ pub async fn download_pending_mzml_with_backend(
     });
 
     while remaining > 0 {
-        let batch = db.pending_downloads(1)?;
+        let batch = db.pending_downloads_filtered(1, filter)?;
         let Some(source) = batch.into_iter().next() else {
             break;
         };

@@ -28,7 +28,7 @@ pub mod zenodo_publish;
 
 pub use config::Config;
 pub use conversion::{ConversionSummary, convert_downloaded_mzml};
-pub use db::{DownloadProgressTotals, StateDb};
+pub use db::{DownloadFilter, DownloadProgressTotals, StateDb};
 pub use index::{
     OpenFormatRecord, SourceFileStatus, VolumeIngestReport, ingest_openformats,
     ingest_volume_manifest,

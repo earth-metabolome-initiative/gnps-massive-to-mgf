@@ -2,9 +2,9 @@
 
 use anyhow::{Context, bail};
 use gnps_massive_to_mgf::{
-    Config, DownloadProgressTotals, IndexFreshness, ProgressEvent, ProgressReporter, ProgressSink,
-    StateDb, convert_downloaded_mzml, download_pending_mzml, ensure_openformats_indexes_fresh,
-    ingest_openformats, ingest_volume_manifest,
+    Config, DownloadFilter, DownloadProgressTotals, IndexFreshness, ProgressEvent,
+    ProgressReporter, ProgressSink, StateDb, convert_downloaded_mzml, download_pending_mzml,
+    ensure_openformats_indexes_fresh, ingest_openformats, ingest_volume_manifest,
 };
 use indicatif::ProgressBar;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -31,7 +31,8 @@ async fn main() -> anyhow::Result<()> {
             refresh_indexes_and_ingest(&mut db, &config, &progress).await?;
             let (sink, rx) = ProgressSink::channel();
             let adapter = tokio::spawn(run_indicatif_adapter(progress.clone(), rx));
-            let download_result = download_pending_mzml(&mut db, &config, &sink)
+            let filter = DownloadFilter::default();
+            let download_result = download_pending_mzml(&mut db, &config, &sink, &filter)
                 .await
                 .context("failed to download pending mzML files");
             drop(sink);

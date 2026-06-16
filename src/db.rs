@@ -114,6 +114,36 @@ pub struct FinalizedShardRow {
     pub sha256: Option<String>,
 }
 
+/// Optional allowlist filter applied to [`StateDb::pending_downloads_filtered`].
+///
+/// Each `Some(values)` field restricts the matching column to that allowlist;
+/// `None` leaves the column unconstrained. An empty allowlist (`Some(vec![])`)
+/// matches no rows. Dataset filtering carries species/keywords selections from
+/// the TUI: the selection screen resolves them to a dataset allowlist using
+/// the in-memory manifest map.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DownloadFilter {
+    /// Allowed values for `source_files.instrument_vendor`.
+    pub vendors: Option<Vec<String>>,
+    /// Allowed values for `source_files.instrument_model`.
+    pub models: Option<Vec<String>>,
+    /// Allowed values for `source_files.extension`.
+    pub extensions: Option<Vec<String>>,
+    /// Allowed values for `source_files.dataset`.
+    pub datasets: Option<Vec<String>>,
+}
+
+impl DownloadFilter {
+    /// Returns whether the filter is wide open (no constraints).
+    #[must_use]
+    pub const fn is_unconstrained(&self) -> bool {
+        self.vendors.is_none()
+            && self.models.is_none()
+            && self.extensions.is_none()
+            && self.datasets.is_none()
+    }
+}
+
 /// Cumulative download workload totals across the planned source files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -377,21 +407,73 @@ ON CONFLICT(filepath) DO UPDATE SET
     ///
     /// Returns an error if the query fails.
     pub fn pending_downloads(&mut self, limit: usize) -> anyhow::Result<Vec<SourceFileRow>> {
+        self.pending_downloads_filtered(limit, &DownloadFilter::default())
+    }
+
+    /// Returns source files pending download, constrained by `filter`.
+    ///
+    /// When `filter` is unconstrained, this returns the same rows as
+    /// [`Self::pending_downloads`]. Each `Some(values)` field on the filter
+    /// adds an `IN (...)` clause on the corresponding `source_files` column;
+    /// an empty allowlist yields zero matches without querying SQLite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn pending_downloads_filtered(
+        &mut self,
+        limit: usize,
+        filter: &DownloadFilter,
+    ) -> anyhow::Result<Vec<SourceFileRow>> {
         let limit = i64::try_from(limit).context("download limit does not fit i64")?;
-        sql_query(
+        let clauses = [
+            ("instrument_vendor", filter.vendors.as_deref()),
+            ("instrument_model", filter.models.as_deref()),
+            ("extension", filter.extensions.as_deref()),
+            ("dataset", filter.datasets.as_deref()),
+        ];
+        for (_, values) in clauses {
+            if values.is_some_and(<[String]>::is_empty) {
+                return Ok(Vec::new());
+            }
+        }
+
+        let mut sql = String::from(
             "\
 SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
        spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
        volume
 FROM source_files
-WHERE status = 'indexed'
-ORDER BY selected_order
-LIMIT ?
-",
-        )
-        .bind::<BigInt, _>(limit)
-        .load::<SourceFileRow>(&mut self.connection)
-        .context("failed to load pending downloads")
+WHERE status = 'indexed'",
+        );
+        for (column, values) in clauses {
+            if let Some(values) = values {
+                sql.push_str("\n  AND ");
+                sql.push_str(column);
+                sql.push_str(" IN (");
+                for index in 0..values.len() {
+                    if index > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push('?');
+                }
+                sql.push(')');
+            }
+        }
+        sql.push_str("\nORDER BY selected_order\nLIMIT ?");
+
+        let mut query = sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();
+        for (_, values) in clauses {
+            if let Some(values) = values {
+                for value in values {
+                    query = query.bind::<Text, _>(value.as_str());
+                }
+            }
+        }
+        query = query.bind::<BigInt, _>(limit);
+        query
+            .load::<SourceFileRow>(&mut self.connection)
+            .context("failed to load pending downloads")
     }
 
     /// Returns the total indexed bytes still pending download.
@@ -1180,7 +1262,7 @@ mod tests {
 
     use crate::index::{OpenFormatRecord, SourceFileStatus};
 
-    use super::{SourceConversionRecord, SpectrumSeenRecord, StateDb};
+    use super::{DownloadFilter, SourceConversionRecord, SpectrumSeenRecord, StateDb};
 
     /// Confirms the schema can be initialized in memory.
     #[test]
@@ -1408,6 +1490,110 @@ mod tests {
         assert_eq!(summary.files_converted, 1);
         assert_eq!(summary.spectra_written, 1);
         assert_eq!(summary.duplicates_skipped, 1);
+        Ok(())
+    }
+
+    /// Confirms `pending_downloads_filtered` honours each filter dimension.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single end-to-end exercise of every DownloadFilter dimension; splitting would obscure the cross-axis assertions"
+    )]
+    fn pending_downloads_filtered_honours_each_dimension() -> anyhow::Result<()> {
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+
+        let mut alpha = test_record_for_dataset("MSV000000001/a.mzML", "MSV000000001", 1.0, 100);
+        alpha.instrument_vendor = "Thermo".to_owned();
+        alpha.instrument_model = "Q Exactive".to_owned();
+        alpha.extension = ".mzML".to_owned();
+
+        let mut beta = test_record_for_dataset("MSV000000002/b.mzML", "MSV000000002", 1.0, 200);
+        beta.instrument_vendor = "Bruker".to_owned();
+        beta.instrument_model = "timsTOF".to_owned();
+        beta.extension = ".mzML".to_owned();
+
+        let mut gamma = test_record_for_dataset("MSV000000003/c.mzXML", "MSV000000003", 1.0, 300);
+        gamma.instrument_vendor = "Thermo".to_owned();
+        gamma.instrument_model = "Orbitrap Fusion".to_owned();
+        gamma.extension = ".mzXML".to_owned();
+
+        for (record, order) in [(&alpha, 0), (&beta, 1), (&gamma, 2)] {
+            db.upsert_source_file(
+                record,
+                Path::new(&format!("/tmp/{order}.mzML")),
+                order,
+                SourceFileStatus::Indexed,
+                None,
+            )?;
+        }
+
+        let all = db.pending_downloads_filtered(10, &DownloadFilter::default())?;
+        assert_eq!(all.len(), 3);
+
+        let vendor_only = db.pending_downloads_filtered(
+            10,
+            &DownloadFilter {
+                vendors: Some(vec!["Thermo".to_owned()]),
+                ..DownloadFilter::default()
+            },
+        )?;
+        assert_eq!(vendor_only.len(), 2);
+        assert!(
+            vendor_only
+                .iter()
+                .all(|row| row.instrument_vendor == "Thermo")
+        );
+
+        let model_only = db.pending_downloads_filtered(
+            10,
+            &DownloadFilter {
+                models: Some(vec!["timsTOF".to_owned()]),
+                ..DownloadFilter::default()
+            },
+        )?;
+        assert_eq!(model_only.len(), 1);
+        assert_eq!(model_only[0].filepath, "MSV000000002/b.mzML");
+
+        let extension_only = db.pending_downloads_filtered(
+            10,
+            &DownloadFilter {
+                extensions: Some(vec![".mzXML".to_owned()]),
+                ..DownloadFilter::default()
+            },
+        )?;
+        assert_eq!(extension_only.len(), 1);
+        assert_eq!(extension_only[0].filepath, "MSV000000003/c.mzXML");
+
+        let dataset_only = db.pending_downloads_filtered(
+            10,
+            &DownloadFilter {
+                datasets: Some(vec!["MSV000000001".to_owned(), "MSV000000003".to_owned()]),
+                ..DownloadFilter::default()
+            },
+        )?;
+        assert_eq!(dataset_only.len(), 2);
+
+        let combined = db.pending_downloads_filtered(
+            10,
+            &DownloadFilter {
+                vendors: Some(vec!["Thermo".to_owned()]),
+                extensions: Some(vec![".mzML".to_owned()]),
+                ..DownloadFilter::default()
+            },
+        )?;
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].filepath, "MSV000000001/a.mzML");
+
+        let empty = db.pending_downloads_filtered(
+            10,
+            &DownloadFilter {
+                vendors: Some(Vec::new()),
+                ..DownloadFilter::default()
+            },
+        )?;
+        assert!(empty.is_empty());
+
         Ok(())
     }
 
