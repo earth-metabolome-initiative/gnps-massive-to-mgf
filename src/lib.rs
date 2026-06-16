@@ -23,6 +23,8 @@ pub mod massive;
 pub mod progress;
 /// Channel-based progress events emitted by the download path.
 pub mod progress_sink;
+/// `ratatui` terminal UI for the `download` subcommand.
+pub mod tui;
 /// Zenodo open-format index download.
 pub mod zenodo_publish;
 
@@ -36,4 +38,5 @@ pub use index::{
 pub use massive::download_pending_mzml;
 pub use progress::ProgressReporter;
 pub use progress_sink::{ProgressEvent, ProgressSink};
+pub use tui::run_download_tui;
 pub use zenodo_publish::{IndexFreshness, ensure_openformats_indexes_fresh};

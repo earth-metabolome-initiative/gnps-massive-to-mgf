@@ -12,6 +12,7 @@ categories = ["science"]
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 csv = "1.4.0"
 diesel = { version = "2.3.3", features = ["sqlite", "chrono", "returning_clauses_for_sqlite_3_35"] }
 dotenvy = "0.15.7"
@@ -19,6 +20,7 @@ futures-util = "0.3.32"
 indicatif = "0.18.4"
 mascot-rs = { git = "https://github.com/LucaCappelletti94/mascot-rs" }
 mzdata = { version = "0.63.4", default-features = false, features = ["mzml", "zlib-ng-compat"] }
+ratatui = "0.30.1"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 zenodo-rs = { version = "0.2", default-features = false, features = ["rustls-ring-tls", "indicatif"] }

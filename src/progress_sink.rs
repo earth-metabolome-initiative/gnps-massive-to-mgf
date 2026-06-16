@@ -32,7 +32,7 @@ pub enum ProgressEvent {
         /// Row pulled from `source_files` (boxed to keep [`ProgressEvent`] slim).
         source: Box<SourceFileRow>,
     },
-    /// The on-disk file already matched the indexed size; no FTPS transfer
+    /// The on-disk file already matched the indexed size, so no FTPS transfer
     /// will run. The bytes count is the full expected size.
     FileAlreadyPresent {
         /// Bytes that should be credited to the aggregate counter.
@@ -52,7 +52,7 @@ pub enum ProgressEvent {
         /// Cumulative bytes (not a delta).
         delivered: u64,
     },
-    /// The current attempt finished successfully; the receiver should hide
+    /// The current attempt finished successfully, so the receiver should hide
     /// the per-attempt bar.
     AttemptFinished,
     /// The current file completed successfully across one or more attempts.
@@ -69,7 +69,7 @@ pub enum ProgressEvent {
         /// Combined error message (`format!("{error:#}")`).
         error: String,
     },
-    /// The download loop has exited; carries final tallies.
+    /// The download loop has exited. Carries final tallies.
     DownloadFinished {
         /// Files that ended in `downloaded` status (including already-present).
         downloaded: u64,
