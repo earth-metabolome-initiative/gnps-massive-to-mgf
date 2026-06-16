@@ -2,9 +2,9 @@
 
 use anyhow::{Context, bail};
 use gnps_massive_to_mgf::{
-    Config, IndexFreshness, ProgressReporter, StateDb, collect_pipeline_status,
-    convert_downloaded_mzml, download_pending_mzml, ensure_openformats_indexes_fresh,
-    ingest_openformats, ingest_volume_manifest, run_pipeline,
+    Config, IndexFreshness, ProgressReporter, StateDb, convert_downloaded_mzml,
+    download_pending_mzml, ensure_openformats_indexes_fresh, ingest_openformats,
+    ingest_volume_manifest,
 };
 
 /// Runs the requested pipeline subcommand.
@@ -39,18 +39,11 @@ async fn main() -> anyhow::Result<()> {
                 summary.spectra_written, summary.shards_written
             ))?;
         }
-        Some("status") => {
-            let status = collect_pipeline_status(&mut db, &config)
-                .context("failed to collect pipeline status")?;
-            for line in status.lines() {
-                println!("{line}");
-            }
-        }
-        Some("run") | None => {
-            run_pipeline(&mut db, &config, &progress).await?;
-        }
         Some(command) => {
-            bail!("unknown command {command}; expected one of: download, convert, status, run");
+            bail!("unknown command {command}; expected one of: download, convert");
+        }
+        None => {
+            bail!("no command provided; expected one of: download, convert");
         }
     }
 

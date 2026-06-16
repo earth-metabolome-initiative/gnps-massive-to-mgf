@@ -19,12 +19,8 @@ pub mod ftps_tofu;
 pub mod index;
 /// MassIVE file download helpers.
 pub mod massive;
-/// End-to-end pipeline orchestration.
-pub mod pipeline;
 /// Terminal progress reporting.
 pub mod progress;
-/// Read-only pipeline status reporting.
-pub mod status;
 /// Zenodo open-format index download.
 pub mod zenodo_publish;
 
@@ -36,7 +32,5 @@ pub use index::{
     ingest_volume_manifest,
 };
 pub use massive::download_pending_mzml;
-pub use pipeline::{PipelineDecision, decide_next_pipeline_step, run_pipeline};
 pub use progress::ProgressReporter;
-pub use status::{PipelineStatus, collect_pipeline_status};
 pub use zenodo_publish::{IndexFreshness, ensure_openformats_indexes_fresh};

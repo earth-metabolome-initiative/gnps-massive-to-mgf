@@ -1092,51 +1092,6 @@ WHERE top_k_peaks = ? AND status = 'failed'
         i64_to_u64(row.count, "failed conversion count")
     }
 
-    /// Promotes candidate mzML files to the download queue until an MS/MS budget is reached.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if SQLite rejects a query or update.
-    pub fn promote_candidates_by_ms2(&mut self, target_ms2: u64) -> anyhow::Result<u64> {
-        let candidates = sql_query(
-            "\
-SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
-       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
-       volume
-FROM source_files
-WHERE status = 'candidate'
-ORDER BY selected_order
-",
-        )
-        .load::<SourceFileRow>(&mut self.connection)
-        .context("failed to load candidate source files")?;
-        let mut promoted = 0_u64;
-        let mut promoted_ms2 = 0_u64;
-        for candidate in candidates {
-            if promoted_ms2 >= target_ms2 {
-                break;
-            }
-            sql_query(
-                "\
-UPDATE source_files
-SET status = 'indexed', updated_at = CURRENT_TIMESTAMP
-WHERE filepath = ? AND status = 'candidate'
-",
-            )
-            .bind::<Text, _>(&candidate.filepath)
-            .execute(&mut self.connection)
-            .context("failed to promote candidate source file")?;
-            promoted = promoted.saturating_add(1);
-            promoted_ms2 = promoted_ms2.saturating_add(
-                candidate
-                    .spectra_ms2
-                    .and_then(f64_to_u64)
-                    .unwrap_or_default(),
-            );
-        }
-        Ok(promoted)
-    }
-
     /// Marks a source file failed with the requested status.
     fn mark_failed(
         &mut self,
@@ -1174,15 +1129,6 @@ pub fn spectrum_dedupe_key(splash: &str, pepmass: f64) -> String {
 /// Converts a non-negative SQLite integer to `u64`.
 fn i64_to_u64(value: i64, label: &str) -> anyhow::Result<u64> {
     u64::try_from(value).with_context(|| format!("{label} does not fit u64"))
-}
-
-/// Converts a finite non-negative `f64` to `u64` after bounds checking.
-fn f64_to_u64(value: f64) -> Option<u64> {
-    if !(value.is_finite() && value >= 0.0) {
-        return None;
-    }
-    let text = format!("{value:.0}");
-    text.parse::<u64>().ok()
 }
 
 /// Adds the `volume` column to `source_files` if it does not already exist.
@@ -1405,25 +1351,6 @@ mod tests {
         assert_eq!(totals.planned_bytes, 4_000);
         assert_eq!(totals.completed_files, 1);
         assert_eq!(totals.completed_bytes, 1_000);
-        Ok(())
-    }
-
-    /// Confirms candidate rows can be promoted into the download queue.
-    #[test]
-    fn promotes_candidate_sources() -> anyhow::Result<()> {
-        let mut db = StateDb::connect(":memory:")?;
-        db.initialize()?;
-        let record = test_record("MSV000000001/path/file.mzML", 10.0);
-        db.upsert_source_file(
-            &record,
-            Path::new("/tmp/file.mzML"),
-            0,
-            SourceFileStatus::Candidate,
-            None,
-        )?;
-        assert_eq!(db.count_status(SourceFileStatus::Candidate)?, 1);
-        assert_eq!(db.promote_candidates_by_ms2(1)?, 1);
-        assert_eq!(db.count_status(SourceFileStatus::Indexed)?, 1);
         Ok(())
     }
 
