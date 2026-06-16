@@ -20,7 +20,7 @@ cargo run --release -- status
 
 The MassIVE FTPS server presents a self-signed certificate. The pipeline pins it via Trust-On-First-Use: the first connection records the cert's SHA-256 hash to `FTPS_CERT_PIN_PATH` (default `data/ftps_cert_pin.txt`) and every subsequent connection verifies the hash matches. If MassIVE rotates the cert, downloads will fail with a clear `pin mismatch` error; delete the pin file to re-trust the server.
 
-`source_files.volume` is populated from the dataset-level manifest at `MASSIVE_VOLUMES_PATH` during the `index` stage. Datasets absent from that manifest (typically new MSVs added after the manifest snapshot) cannot have their FTPS path constructed and fail fast at download time with a clear error.
+`source_files.volume` is populated from the dataset-level manifest at `MASSIVE_VOLUMES_PATH` during the `index` stage. Datasets absent from that manifest (typically new MSVs added after the manifest snapshot) cannot have their FTPS path constructed and fail fast at download time with a clear error. To refresh the mapping, drop a newer TSV at `MASSIVE_VOLUMES_PATH` and re-run `cargo run --release -- index`. The volume ingest is idempotent and only updates rows whose volume actually changed.
 
 Set `FTPS_TRANSFER_TIMEOUT_SECONDS=0` to disable the full-transfer timeout for very large mzML files. The downloader retries failed files on the next run and resumes `.part` files via the FTP `REST` command when the server accepts it.
 
