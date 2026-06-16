@@ -1,5 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::future_not_send,
+    reason = "the binary uses #[tokio::main(flavor = \"current_thread\")] so async tasks never migrate across threads; the Send bound this lint enforces is not meaningful for our runtime choice"
+)]
 
 mod checksum;
 

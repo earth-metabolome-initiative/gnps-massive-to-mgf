@@ -11,13 +11,13 @@
 //! bursts, so adding workers does not raise aggregate throughput and risks
 //! triggering an abuser cool-down that degrades every subsequent connection.
 
-use std::collections::HashMap;
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use indicatif::ProgressBar;
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
 use suppaftp::tokio_rustls::TlsConnector;
@@ -94,54 +94,51 @@ impl FtpsDownloadBackend {
     }
 }
 
-/// Shared aggregate byte progress for the download stage.
-#[derive(Clone)]
+/// Aggregate byte-progress for the download stage.
+///
+/// Downloads are strictly sequential, so we only ever account bytes for one
+/// file at a time. `last_reported` is the cumulative byte count we have
+/// already advanced the aggregate bar by for the in-flight file; the next
+/// `set_file_bytes(total)` advances by `total - last_reported`. Call
+/// [`Self::start_file`] before each new file to reset the counter.
+///
+/// The interior `Cell<u64>` relies on `#[tokio::main(flavor =
+/// "current_thread")]` in `main.rs`: the current-thread runtime never
+/// migrates tasks between OS threads, so `!Sync` interior mutability is
+/// fine across `.await` points.
 struct AggregateDownloadProgress {
     /// Optional aggregate byte bar.
     bar: Option<ProgressBar>,
-    /// Highest accounted byte count per source filepath. The `Mutex` is
-    /// uncontended under the current single-worker design but retained so
-    /// the progress accounting stays correct if the loop is ever fanned out.
-    file_bytes: Arc<Mutex<HashMap<String, u64>>>,
+    /// Cumulative bytes already accounted for the in-flight file.
+    last_reported: Cell<u64>,
 }
 
 impl AggregateDownloadProgress {
     /// Builds a new aggregate progress tracker.
-    fn new(bar: Option<ProgressBar>) -> Self {
+    const fn new(bar: Option<ProgressBar>) -> Self {
         Self {
             bar,
-            file_bytes: Arc::new(Mutex::new(HashMap::new())),
+            last_reported: Cell::new(0),
         }
     }
 
-    /// Records the currently accounted bytes for one source file.
-    fn set_file_bytes(&self, filepath: &str, bytes: u64) -> anyhow::Result<()> {
-        let delta = self.file_byte_delta(filepath, bytes)?;
-        if delta > 0
-            && let Some(bar) = &self.bar
-        {
+    /// Resets the in-flight byte counter; call once per file before reporting.
+    fn start_file(&self) {
+        self.last_reported.set(0);
+    }
+
+    /// Records cumulative bytes for the in-flight file and advances the bar
+    /// by the delta from the previous report. Calls with a non-increasing
+    /// total are no-ops.
+    fn set_file_bytes(&self, bytes: u64) {
+        let previous = self.last_reported.get();
+        if bytes <= previous {
+            return;
+        }
+        let delta = bytes - previous;
+        self.last_reported.set(bytes);
+        if let Some(bar) = &self.bar {
             bar.inc(delta);
-        }
-        Ok(())
-    }
-
-    /// Computes the byte delta for one source file and updates the local cache.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the mutex guard is already scoped to one small progress-cache update"
-    )]
-    fn file_byte_delta(&self, filepath: &str, bytes: u64) -> anyhow::Result<u64> {
-        let mut file_bytes = self
-            .file_bytes
-            .lock()
-            .map_err(|error| anyhow!("download progress lock poisoned: {error}"))?;
-        let current = file_bytes.entry(filepath.to_owned()).or_default();
-        if bytes <= *current {
-            Ok(0)
-        } else {
-            let delta = bytes.saturating_sub(*current);
-            *current = bytes;
-            Ok(delta)
         }
     }
 }
@@ -270,9 +267,15 @@ async fn download_with_retries(
     aggregate_progress: &AggregateDownloadProgress,
     source: &SourceFileRow,
 ) -> anyhow::Result<u64> {
+    // Reset the in-flight byte counter once per file. Subsequent
+    // `set_file_bytes` calls advance the aggregate bar only when they exceed
+    // the high-water mark, so retries that REST-resume from a partial offset
+    // do not double-count bytes already on the bar.
+    aggregate_progress.start_file();
+
     if existing_file_is_complete(source)? {
         let bytes = u64::try_from(source.size_bytes).context("negative source size")?;
-        aggregate_progress.set_file_bytes(&source.filepath, bytes)?;
+        aggregate_progress.set_file_bytes(bytes);
         progress.println(format!("already downloaded: {}", source.filepath))?;
         return Ok(bytes);
     }
@@ -331,7 +334,7 @@ async fn download_once(
                 destination.display()
             )
         })?;
-        aggregate_progress.set_file_bytes(&source.filepath, expected_bytes)?;
+        aggregate_progress.set_file_bytes(expected_bytes);
         bar.finish_and_clear();
         return Ok(expected_bytes);
     }
@@ -377,7 +380,7 @@ async fn download_once(
     let mut downloaded = starting_bytes;
     if starting_bytes > 0 {
         bar.inc(starting_bytes);
-        aggregate_progress.set_file_bytes(&source.filepath, starting_bytes)?;
+        aggregate_progress.set_file_bytes(starting_bytes);
     }
 
     let transfer = async {
@@ -400,7 +403,7 @@ async fn download_once(
                 .with_context(|| format!("failed to write {}", part_path.display()))?;
             downloaded = downloaded.saturating_add(chunk_len);
             bar.inc(chunk_len);
-            aggregate_progress.set_file_bytes(&source.filepath, downloaded)?;
+            aggregate_progress.set_file_bytes(downloaded);
         }
         stream
             .finalize_retr_stream(data)

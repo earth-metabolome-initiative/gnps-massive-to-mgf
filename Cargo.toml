@@ -25,7 +25,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
 suppaftp = { version = "8", default-features = false, features = ["tokio", "tokio-rustls-ring"] }
-tokio = { version = "1.52.2", features = ["fs", "macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1.52.2", features = ["fs", "macros", "net", "rt", "sync"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
 zenodo-rs = "0.1.6"
 zstd = { version = "0.13.3", features = ["zstdmt"] }

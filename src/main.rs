@@ -8,7 +8,14 @@ use gnps_massive_to_mgf::{
 };
 
 /// Runs the requested pipeline subcommand.
-#[tokio::main]
+///
+/// Uses the `current_thread` runtime: the pipeline runs a single async task
+/// at a time (one FTPS download in flight, one Zenodo index fetch, etc.) and
+/// gains nothing from work-stealing across worker threads. Picking the
+/// single-thread runtime drops the worker threadpool, removes the `Send`
+/// bound on futures, and lets the download progress accounting use plain
+/// `Cell` instead of atomics.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let progress = ProgressReporter::new();
