@@ -523,9 +523,6 @@ MSV000000001\tv01\tNULL\tNULL
             ftps_cert_pin_path: root.join("ftps_cert_pin.txt"),
             ftps_connect_timeout: Duration::from_secs(1),
             ftps_transfer_timeout: None,
-            publish_to_zenodo: false,
-            zenodo_deposition_id: None,
-            zenodo_max_file_bytes: 50_000_000_000,
         }
     }
 }

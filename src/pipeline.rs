@@ -8,7 +8,7 @@ use crate::db::StateDb;
 use crate::index::{ingest_openformats, ingest_volume_manifest};
 use crate::massive::download_pending_mzml;
 use crate::progress::ProgressReporter;
-use crate::zenodo_publish::{download_openformats_indexes, publish_outputs_to_zenodo};
+use crate::zenodo_publish::download_openformats_indexes;
 
 /// Decision made after one download-conversion pipeline round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub enum PipelineDecision {
     NoMoreCandidates,
 }
 
-/// Runs indexing, download, conversion, and optional publication until the target is reached.
+/// Runs indexing, download, and conversion until the target is reached.
 ///
 /// # Errors
 ///
@@ -31,7 +31,7 @@ pub async fn run_pipeline(
     config: &Config,
     progress: &ProgressReporter,
 ) -> anyhow::Result<()> {
-    let pipeline_bar = progress.count_bar(3, "pipeline | indexing open-format files")?;
+    let pipeline_bar = progress.count_bar(2, "pipeline | indexing open-format files")?;
     download_openformats_indexes(config, progress)
         .await
         .context("failed to download open-format index files")?;
@@ -83,16 +83,6 @@ pub async fn run_pipeline(
             }
         }
     }
-    pipeline_bar.set_message("pipeline | publishing");
-    if config.publish_to_zenodo {
-        let record = Box::pin(publish_outputs_to_zenodo(db, config, progress))
-            .await
-            .context("failed to publish outputs to Zenodo")?;
-        progress.println(format!("published Zenodo record: {}", record.record.id))?;
-    } else {
-        progress.println("Zenodo publication skipped because ZENODO_TOKEN is not set")?;
-    }
-    pipeline_bar.inc(1);
     pipeline_bar.finish_with_message("pipeline complete");
     Ok(())
 }

@@ -27,11 +27,9 @@ sha2 = "0.11.0"
 suppaftp = { version = "8", default-features = false, features = ["tokio", "tokio-rustls-ring"] }
 tokio = { version = "1.52.2", features = ["fs", "macros", "net", "rt", "sync"] }
 tokio-util = { version = "0.7.18", features = ["io"] }
-zenodo-rs = "0.1.6"
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 
 [dev-dependencies]
-axum = "0.8.7"
 tempfile = "3.27.0"
 
 [profile.release]

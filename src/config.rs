@@ -42,8 +42,6 @@ const DEFAULT_FTPS_TRANSFER_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_SOURCE_SELECTION_BUFFER: f64 = 1.25;
 /// Default extra indexed MS/MS spectra promoted when the unique target is short.
 const DEFAULT_SOURCE_SELECTION_CHUNK_MS2: u64 = 50_000_000;
-/// Default maximum upload file size for Zenodo publication.
-const DEFAULT_ZENODO_MAX_FILE_BYTES: u64 = 50_000_000_000;
 
 /// Runtime configuration for the MassIVE mzML to MGF pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,12 +88,6 @@ pub struct Config {
     pub ftps_connect_timeout: Duration,
     /// FTPS per-file transfer timeout; `None` disables it.
     pub ftps_transfer_timeout: Option<Duration>,
-    /// Whether production Zenodo publication should run.
-    pub publish_to_zenodo: bool,
-    /// Existing production Zenodo deposition id, when configured.
-    pub zenodo_deposition_id: Option<u64>,
-    /// Maximum per-file upload size accepted before publishing.
-    pub zenodo_max_file_bytes: u64,
 }
 
 impl Config {
@@ -162,15 +154,6 @@ impl Config {
             bail!("SOURCE_SELECTION_CHUNK_MS2 must be positive");
         }
 
-        let zenodo_max_file_bytes = parse_u64(
-            read_env,
-            "ZENODO_MAX_FILE_BYTES",
-            DEFAULT_ZENODO_MAX_FILE_BYTES,
-        )?;
-        if zenodo_max_file_bytes == 0 {
-            bail!("ZENODO_MAX_FILE_BYTES must be positive");
-        }
-
         let ftps_transfer_timeout_seconds = parse_u64(
             read_env,
             "FTPS_TRANSFER_TIMEOUT_SECONDS",
@@ -235,9 +218,6 @@ impl Config {
             )?),
             ftps_transfer_timeout: (ftps_transfer_timeout_seconds > 0)
                 .then(|| Duration::from_secs(ftps_transfer_timeout_seconds)),
-            publish_to_zenodo: env_present(read_env, "ZENODO_TOKEN")?,
-            zenodo_deposition_id: parse_optional_u64(read_env, "ZENODO_DEPOSITION_ID")?,
-            zenodo_max_file_bytes,
         })
     }
 
@@ -313,21 +293,6 @@ fn parse_f64(
     }
 }
 
-/// Parses an optional `u64` environment variable.
-fn parse_optional_u64(
-    read_env: &impl Fn(&str) -> anyhow::Result<Option<String>>,
-    name: &str,
-) -> anyhow::Result<Option<u64>> {
-    match read_env(name)? {
-        Some(value) if !value.trim().is_empty() => value
-            .trim()
-            .parse::<u64>()
-            .map(Some)
-            .with_context(|| format!("failed to parse {name} as u64")),
-        Some(_) | None => Ok(None),
-    }
-}
-
 /// Parses an environment variable as a string, falling back to a default.
 fn parse_string(
     read_env: &impl Fn(&str) -> anyhow::Result<Option<String>>,
@@ -346,14 +311,6 @@ fn parse_path(
     default: &str,
 ) -> anyhow::Result<PathBuf> {
     Ok(Path::new(&parse_string(read_env, name, default)?).to_path_buf())
-}
-
-/// Returns whether an environment variable is present and non-empty.
-fn env_present(
-    read_env: &impl Fn(&str) -> anyhow::Result<Option<String>>,
-    name: &str,
-) -> anyhow::Result<bool> {
-    Ok(read_env(name)?.is_some_and(|value| !value.is_empty()))
 }
 
 #[cfg(test)]
@@ -384,7 +341,6 @@ mod tests {
             PathBuf::from("data/ftps_cert_pin.txt"),
         );
         assert_eq!(config.ftps_transfer_timeout, Some(Duration::from_mins(10)));
-        assert!(!config.publish_to_zenodo);
         Ok(())
     }
 

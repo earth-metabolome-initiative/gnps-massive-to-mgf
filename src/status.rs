@@ -7,7 +7,6 @@ use anyhow::Context;
 use crate::config::Config;
 use crate::db::{ConversionDbSummary, FinalizedShardRow, StateDb};
 use crate::index::SourceFileStatus;
-use crate::zenodo_publish::validate_outputs_for_publication;
 
 /// Counts of source files by stored source status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,32 +43,6 @@ impl SourceStatusCounts {
     }
 }
 
-/// Local publication readiness derived from validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PublicationReadiness {
-    /// Whether local outputs are ready for publication.
-    pub ready: bool,
-    /// Blocking validation messages, when publication is not ready.
-    pub blockers: Vec<String>,
-}
-
-impl PublicationReadiness {
-    /// Builds readiness from a validation result.
-    fn from_result(result: anyhow::Result<()>) -> Self {
-        match result {
-            Ok(()) => Self {
-                ready: true,
-                blockers: Vec::new(),
-            },
-            Err(error) => Self {
-                ready: false,
-                blockers: validation_blockers(&error),
-            },
-        }
-    }
-}
-
 /// Read-only summary of the pipeline state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -92,15 +65,13 @@ pub struct PipelineStatus {
     pub largest_shard_path: Option<PathBuf>,
     /// Largest finalized shard byte count, or zero when no finalized shard exists.
     pub largest_shard_bytes: u64,
-    /// Publication readiness derived from local validation.
-    pub publication_readiness: PublicationReadiness,
 }
 
 impl PipelineStatus {
     /// Formats this status as stable human-readable lines.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![
+        let lines = vec![
             "pipeline status".to_owned(),
             format!("top_k_peaks: {}", self.top_k_peaks),
             format!("target_ms2_spectra: {}", self.target_ms2_spectra),
@@ -135,17 +106,6 @@ impl PipelineStatus {
                 self.largest_shard_label()
             ),
         ];
-        if self.publication_readiness.ready {
-            lines.push("publish readiness: ready".to_owned());
-        } else {
-            lines.push("publish readiness: blocked".to_owned());
-            lines.extend(
-                self.publication_readiness
-                    .blockers
-                    .iter()
-                    .map(|blocker| format!("publish blocker: {blocker}")),
-            );
-        }
         lines
     }
 
@@ -173,8 +133,6 @@ pub fn collect_pipeline_status(
     let finalized_shards = db.finalized_shards(config.top_k_peaks)?;
     let (shard_count, finalized_shard_bytes, largest_shard_path, largest_shard_bytes) =
         summarize_shards(&finalized_shards)?;
-    let publication_readiness =
-        PublicationReadiness::from_result(validate_outputs_for_publication(db, config));
     Ok(PipelineStatus {
         top_k_peaks: config.top_k_peaks,
         target_ms2_spectra: config.target_ms2_spectra,
@@ -185,7 +143,6 @@ pub fn collect_pipeline_status(
         finalized_shard_bytes,
         largest_shard_path,
         largest_shard_bytes,
-        publication_readiness,
     })
 }
 
@@ -212,24 +169,6 @@ fn summarize_shards(
     ))
 }
 
-/// Extracts human-readable validation blockers from an `anyhow` error.
-fn validation_blockers(error: &anyhow::Error) -> Vec<String> {
-    let text = error.to_string();
-    let mut blockers = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if blockers
-        .first()
-        .is_some_and(|line| line == "publication validation failed:")
-    {
-        blockers.remove(0);
-    }
-    blockers
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -246,7 +185,7 @@ mod tests {
 
     /// Confirms status reports DB counts, conversion counters, shard bytes, and readiness.
     #[test]
-    fn status_reports_counts_and_publish_readiness() -> anyhow::Result<()> {
+    fn status_reports_counts_and_shard_summary() -> anyhow::Result<()> {
         let tempdir = tempdir()?;
         let mut db = StateDb::connect(":memory:")?;
         db.initialize()?;
@@ -277,14 +216,6 @@ mod tests {
         assert_eq!(status.conversion_summary.spectra_written, 1);
         assert_eq!(status.shard_count, 1);
         assert_eq!(status.finalized_shard_bytes, 3);
-        assert!(!status.publication_readiness.ready);
-        assert!(
-            status
-                .publication_readiness
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("selected source file(s) still need download"))
-        );
         Ok(())
     }
 
@@ -371,9 +302,6 @@ mod tests {
             ftps_cert_pin_path: root.join("ftps_cert_pin.txt"),
             ftps_connect_timeout: Duration::from_secs(1),
             ftps_transfer_timeout: None,
-            publish_to_zenodo: false,
-            zenodo_deposition_id: None,
-            zenodo_max_file_bytes: 50_000_000_000,
         }
     }
 }

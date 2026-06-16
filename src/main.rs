@@ -4,7 +4,7 @@ use anyhow::{Context, bail};
 use gnps_massive_to_mgf::{
     Config, ProgressReporter, StateDb, collect_pipeline_status, convert_downloaded_mzml,
     download_openformats_indexes, download_pending_mzml, ingest_openformats,
-    ingest_volume_manifest, publication_dry_run, publish_outputs_to_zenodo, run_pipeline,
+    ingest_volume_manifest, run_pipeline,
 };
 
 /// Runs the requested pipeline subcommand.
@@ -57,19 +57,6 @@ async fn main() -> anyhow::Result<()> {
                 summary.spectra_written, summary.shards_written
             ))?;
         }
-        Some("publish") => {
-            let record = Box::pin(publish_outputs_to_zenodo(&mut db, &config, &progress))
-                .await
-                .context("failed to publish outputs to Zenodo")?;
-            progress.println(format!("published Zenodo record: {}", record.record.id))?;
-        }
-        Some("publish-dry-run") => {
-            let summary = publication_dry_run(&mut db, &config)
-                .context("failed to prepare Zenodo publication dry run")?;
-            for line in summary.lines() {
-                println!("{line}");
-            }
-        }
         Some("status") => {
             let status = collect_pipeline_status(&mut db, &config)
                 .context("failed to collect pipeline status")?;
@@ -82,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(command) => {
             bail!(
-                "unknown command {command}; expected one of: index, download, convert, publish, publish-dry-run, status, run"
+                "unknown command {command}; expected one of: index, download, convert, status, run"
             );
         }
     }

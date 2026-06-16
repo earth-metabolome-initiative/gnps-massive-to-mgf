@@ -25,7 +25,7 @@ pub mod pipeline;
 pub mod progress;
 /// Read-only pipeline status reporting.
 pub mod status;
-/// Zenodo index download and result publication.
+/// Zenodo open-format index download.
 pub mod zenodo_publish;
 
 pub use config::Config;
@@ -39,7 +39,4 @@ pub use massive::download_pending_mzml;
 pub use pipeline::{PipelineDecision, decide_next_pipeline_step, run_pipeline};
 pub use progress::ProgressReporter;
 pub use status::{PipelineStatus, collect_pipeline_status};
-pub use zenodo_publish::{
-    PublicationDryRunSummary, download_openformats_indexes, publication_dry_run,
-    publish_outputs_to_zenodo,
-};
+pub use zenodo_publish::download_openformats_indexes;
