@@ -21,6 +21,8 @@ pub mod index;
 pub mod massive;
 /// Terminal progress reporting.
 pub mod progress;
+/// Channel-based progress events emitted by the download path.
+pub mod progress_sink;
 /// Zenodo open-format index download.
 pub mod zenodo_publish;
 
@@ -33,4 +35,5 @@ pub use index::{
 };
 pub use massive::download_pending_mzml;
 pub use progress::ProgressReporter;
+pub use progress_sink::{ProgressEvent, ProgressSink};
 pub use zenodo_publish::{IndexFreshness, ensure_openformats_indexes_fresh};

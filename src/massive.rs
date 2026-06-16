@@ -10,15 +10,16 @@
 //! across concurrent connections from the same IP and additionally throttles
 //! bursts, so adding workers does not raise aggregate throughput and risks
 //! triggering an abuser cool-down that degrades every subsequent connection.
+//!
+//! Progress is reported by writing [`ProgressEvent`]s to a [`ProgressSink`];
+//! the consumer (indicatif adapter or `ratatui` TUI) decides how to render.
 
-use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use indicatif::ProgressBar;
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
 use suppaftp::tokio_rustls::TlsConnector;
 use suppaftp::types::FileType;
@@ -28,7 +29,7 @@ use crate::config::Config;
 use crate::db::{SourceFileRow, StateDb};
 use crate::ftps_tofu::{TofuCertVerifier, rustls_config};
 use crate::index::SourceFileStatus;
-use crate::progress::ProgressReporter;
+use crate::progress_sink::{ProgressEvent, ProgressSink};
 
 /// FTPS client for MassIVE anonymous downloads.
 ///
@@ -94,55 +95,6 @@ impl FtpsDownloadBackend {
     }
 }
 
-/// Aggregate byte-progress for the download stage.
-///
-/// Downloads are strictly sequential, so we only ever account bytes for one
-/// file at a time. `last_reported` is the cumulative byte count we have
-/// already advanced the aggregate bar by for the in-flight file; the next
-/// `set_file_bytes(total)` advances by `total - last_reported`. Call
-/// [`Self::start_file`] before each new file to reset the counter.
-///
-/// The interior `Cell<u64>` relies on `#[tokio::main(flavor =
-/// "current_thread")]` in `main.rs`: the current-thread runtime never
-/// migrates tasks between OS threads, so `!Sync` interior mutability is
-/// fine across `.await` points.
-struct AggregateDownloadProgress {
-    /// Optional aggregate byte bar.
-    bar: Option<ProgressBar>,
-    /// Cumulative bytes already accounted for the in-flight file.
-    last_reported: Cell<u64>,
-}
-
-impl AggregateDownloadProgress {
-    /// Builds a new aggregate progress tracker.
-    const fn new(bar: Option<ProgressBar>) -> Self {
-        Self {
-            bar,
-            last_reported: Cell::new(0),
-        }
-    }
-
-    /// Resets the in-flight byte counter; call once per file before reporting.
-    fn start_file(&self) {
-        self.last_reported.set(0);
-    }
-
-    /// Records cumulative bytes for the in-flight file and advances the bar
-    /// by the delta from the previous report. Calls with a non-increasing
-    /// total are no-ops.
-    fn set_file_bytes(&self, bytes: u64) {
-        let previous = self.last_reported.get();
-        if bytes <= previous {
-            return;
-        }
-        let delta = bytes - previous;
-        self.last_reported.set(bytes);
-        if let Some(bar) = &self.bar {
-            bar.inc(delta);
-        }
-    }
-}
-
 /// Downloads pending mzML files into the configured raw download directory.
 ///
 /// Files are downloaded sequentially via anonymous FTPS. Each file is written
@@ -152,14 +104,14 @@ impl AggregateDownloadProgress {
 ///
 /// # Errors
 ///
-/// Returns an error if the database query fails or progress rendering fails.
+/// Returns an error if the database query fails.
 pub async fn download_pending_mzml(
     db: &mut StateDb,
     config: &Config,
-    progress: &ProgressReporter,
+    sink: &ProgressSink,
 ) -> anyhow::Result<()> {
     let backend = FtpsDownloadBackend::from_config(config)?;
-    download_pending_mzml_with_backend(db, config, progress, backend).await
+    download_pending_mzml_with_backend(db, config, sink, backend).await
 }
 
 /// Downloads pending mzML files using the supplied FTPS backend.
@@ -169,93 +121,67 @@ pub async fn download_pending_mzml(
 ///
 /// # Errors
 ///
-/// Returns an error if a database query fails, progress rendering fails, or
-/// the loop cannot complete a download retry cycle.
+/// Returns an error if a database query fails or the loop cannot complete a
+/// download retry cycle.
 pub async fn download_pending_mzml_with_backend(
     db: &mut StateDb,
     config: &Config,
-    progress: &ProgressReporter,
+    sink: &ProgressSink,
     backend: FtpsDownloadBackend,
 ) -> anyhow::Result<()> {
     let reset = db.reset_download_failures()?;
     if reset > 0 {
-        progress.println(format!("retrying {reset} previously failed download(s)"))?;
+        sink.log(format!("retrying {reset} previously failed download(s)"));
     }
     let missing_volume = db.count_missing_volume()?;
     if missing_volume > 0 {
-        progress.println(format!(
+        sink.log(format!(
             "warning: {missing_volume} planned download(s) lack an FTPS volume mapping and will fail fast"
-        ))?;
+        ));
     }
     let totals = db.download_progress_totals()?;
     let mut remaining = db.count_status(SourceFileStatus::Indexed)?;
     let mut downloaded = totals.completed_files;
     let mut failed = 0_u64;
-    progress.println(format!(
+    sink.log(format!(
         "download queue: {remaining} of {} planned mzML file(s) remaining (single worker, FTPS)",
         totals.planned_files,
-    ))?;
-    let files_bar = (totals.planned_files > 0)
-        .then(|| {
-            progress.count_bar(
-                totals.planned_files,
-                format!(
-                    "download files | downloaded_or_present={downloaded} failed={failed} remaining={remaining}"
-                ),
-            )
-        })
-        .transpose()?;
-    if let Some(bar) = &files_bar {
-        bar.inc(totals.completed_files);
-    }
-    let bytes_bar = (totals.planned_bytes > 0)
-        .then(|| progress.byte_bar(totals.planned_bytes, "download total bytes"))
-        .transpose()?;
-    if let Some(bar) = &bytes_bar {
-        bar.inc(totals.completed_bytes);
-    }
-    let aggregate_progress = AggregateDownloadProgress::new(bytes_bar.clone());
+    ));
+    sink.send(ProgressEvent::DownloadStarted {
+        totals,
+        remaining_indexed: remaining,
+    });
 
     while remaining > 0 {
         let batch = db.pending_downloads(1)?;
         let Some(source) = batch.into_iter().next() else {
             break;
         };
-        match download_with_retries(&backend, config, progress, &aggregate_progress, &source).await
-        {
+        sink.send(ProgressEvent::FileStarted {
+            source: Box::new(source.clone()),
+        });
+        match download_with_retries(&backend, config, sink, &source).await {
             Ok(bytes) => {
                 downloaded = downloaded.saturating_add(1);
                 db.mark_downloaded(&source.filepath, bytes)?;
+                sink.send(ProgressEvent::FileFinished {
+                    local_path: source.local_path_buf(),
+                    bytes,
+                });
             }
             Err(error) => {
                 failed = failed.saturating_add(1);
                 let message = format!("{error:#}");
                 db.mark_download_failed(&source.filepath, &message)?;
-                progress.println(format!("download failed: {} | {message}", source.filepath))?;
+                sink.send(ProgressEvent::FileFailed {
+                    filepath: source.filepath.clone(),
+                    error: message,
+                });
             }
         }
-        if let Some(bar) = &files_bar {
-            bar.inc(1);
-        }
         remaining = db.count_status(SourceFileStatus::Indexed)?;
-        if let Some(bar) = &files_bar {
-            bar.set_message(format!(
-                "download files | downloaded_or_present={downloaded} failed={failed} remaining={remaining}"
-            ));
-        }
     }
-    if let Some(bar) = files_bar {
-        bar.finish_with_message(format!(
-            "download files | downloaded_or_present={downloaded} failed={failed} remaining={remaining}"
-        ));
-    }
-    if let Some(bar) = bytes_bar {
-        bar.finish_with_message("download total bytes");
-    }
-    progress.println(format!(
-        "download summary: downloaded_or_present={downloaded} failed={failed}"
-    ))?;
-
+    sink.send(ProgressEvent::DownloadFinished { downloaded, failed });
     Ok(())
 }
 
@@ -263,26 +189,19 @@ pub async fn download_pending_mzml_with_backend(
 async fn download_with_retries(
     backend: &FtpsDownloadBackend,
     config: &Config,
-    progress: &ProgressReporter,
-    aggregate_progress: &AggregateDownloadProgress,
+    sink: &ProgressSink,
     source: &SourceFileRow,
 ) -> anyhow::Result<u64> {
-    // Reset the in-flight byte counter once per file. Subsequent
-    // `set_file_bytes` calls advance the aggregate bar only when they exceed
-    // the high-water mark, so retries that REST-resume from a partial offset
-    // do not double-count bytes already on the bar.
-    aggregate_progress.start_file();
-
     if existing_file_is_complete(source)? {
         let bytes = u64::try_from(source.size_bytes).context("negative source size")?;
-        aggregate_progress.set_file_bytes(bytes);
-        progress.println(format!("already downloaded: {}", source.filepath))?;
+        sink.send(ProgressEvent::FileAlreadyPresent { bytes });
+        sink.log(format!("already downloaded: {}", source.filepath));
         return Ok(bytes);
     }
 
     let mut last_error = None;
     for attempt in 1..=config.download_retry_attempts {
-        match download_once(backend, progress, aggregate_progress, source, attempt).await {
+        match download_once(backend, sink, source, attempt).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 last_error = Some(error);
@@ -307,8 +226,7 @@ async fn download_with_retries(
 )]
 async fn download_once(
     backend: &FtpsDownloadBackend,
-    progress: &ProgressReporter,
-    aggregate_progress: &AggregateDownloadProgress,
+    sink: &ProgressSink,
     source: &SourceFileRow,
     attempt: usize,
 ) -> anyhow::Result<u64> {
@@ -320,11 +238,6 @@ async fn download_once(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let bar = progress.byte_bar(
-        expected_bytes,
-        format!("{} | attempt {attempt}", source.filepath),
-    )?;
-
     let existing_part = partial_size(&part_path)?;
     if existing_part == expected_bytes {
         fs::rename(&part_path, &destination).with_context(|| {
@@ -334,8 +247,12 @@ async fn download_once(
                 destination.display()
             )
         })?;
-        aggregate_progress.set_file_bytes(expected_bytes);
-        bar.finish_and_clear();
+        sink.send(ProgressEvent::AttemptStarted {
+            attempt,
+            expected_bytes,
+            resume_offset: expected_bytes,
+        });
+        sink.send(ProgressEvent::AttemptFinished);
         return Ok(expected_bytes);
     }
 
@@ -353,16 +270,23 @@ async fn download_once(
         match stream.resume_transfer(offset).await {
             Ok(()) => true,
             Err(error) => {
-                progress.println(format!(
+                sink.log(format!(
                     "FTPS did not accept REST resume for {} ({error}); restarting from zero",
                     source.filepath
-                ))?;
+                ));
                 false
             }
         }
     } else {
         false
     };
+
+    let starting_bytes = if resume_accepted { existing_part } else { 0 };
+    sink.send(ProgressEvent::AttemptStarted {
+        attempt,
+        expected_bytes,
+        resume_offset: starting_bytes,
+    });
 
     let mut file = if resume_accepted {
         tokio::fs::OpenOptions::new()
@@ -376,11 +300,11 @@ async fn download_once(
             .with_context(|| format!("failed to create {}", part_path.display()))?
     };
 
-    let starting_bytes = if resume_accepted { existing_part } else { 0 };
     let mut downloaded = starting_bytes;
     if starting_bytes > 0 {
-        bar.inc(starting_bytes);
-        aggregate_progress.set_file_bytes(starting_bytes);
+        sink.send(ProgressEvent::FileBytes {
+            delivered: downloaded,
+        });
     }
 
     let transfer = async {
@@ -402,8 +326,9 @@ async fn download_once(
                 .await
                 .with_context(|| format!("failed to write {}", part_path.display()))?;
             downloaded = downloaded.saturating_add(chunk_len);
-            bar.inc(chunk_len);
-            aggregate_progress.set_file_bytes(downloaded);
+            sink.send(ProgressEvent::FileBytes {
+                delivered: downloaded,
+            });
         }
         stream
             .finalize_retr_stream(data)
@@ -445,7 +370,7 @@ async fn download_once(
             destination.display()
         )
     })?;
-    bar.finish_and_clear();
+    sink.send(ProgressEvent::AttemptFinished);
     Ok(downloaded)
 }
 
