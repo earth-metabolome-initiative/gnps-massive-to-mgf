@@ -7,6 +7,8 @@
 
 mod checksum;
 
+/// Streaming spectrum aggregator for the download TUI.
+pub mod aggregator;
 /// Runtime configuration loaded from `.env` and the process environment.
 pub mod config;
 /// mzML to sharded MGF conversion.

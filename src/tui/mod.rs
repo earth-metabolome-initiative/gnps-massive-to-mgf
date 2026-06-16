@@ -1,16 +1,19 @@
 //! `ratatui` terminal UI for the `download` subcommand.
 //!
 //! The TUI runs on the existing `current_thread` tokio runtime alongside the
-//! single in-flight FTPS download. `tokio::select!` interleaves four sources:
+//! single in-flight FTPS download. `tokio::select!` interleaves five sources:
 //! a fixed-cadence render tick, the [`ProgressEvent`] channel from the
-//! download path, the `crossterm` event stream, and the download future
-//! itself. Pressing `q`, `Esc`, or `Ctrl+C` exits the loop. If the download
-//! is still in flight, dropping its pinned future cancels the FTPS transfer
-//! (the partial `.part` file persists for FTP `REST` resume on the next run).
+//! download path, snapshot updates from the spectrum aggregator, the
+//! `crossterm` event stream, and the download future itself. Pressing `q`,
+//! `Esc`, or `Ctrl+C` exits the loop. If the download is still in flight,
+//! dropping its pinned future cancels the FTPS transfer (the partial `.part`
+//! file persists for FTP `REST` resume on the next run).
 
 use std::collections::VecDeque;
+use std::io::Stdout;
 use std::io::stdout;
 use std::pin::pin;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,8 +25,8 @@ use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::io::Stdout;
 
+use crate::aggregator::{self, AggregateEvent, AggregateSnapshot, AggregatorJob};
 use crate::config::Config;
 use crate::db::{DownloadFilter, DownloadProgressTotals, SourceFileRow, StateDb};
 use crate::massive::download_pending_mzml;
@@ -33,63 +36,46 @@ pub mod running;
 
 /// Maximum log lines retained in the running screen's `Log` tab.
 const MAX_LOG_LINES: usize = 256;
-/// Maximum file rows retained for the `In flight` and `Completed` tabs.
-const MAX_FILE_ROWS: usize = 2048;
 /// Render tick cadence. ~12 fps is plenty for FTPS throughput.
 const TICK_RATE: Duration = Duration::from_millis(80);
-
-/// Outcome of one file in the [`App`]'s file history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileOutcome {
-    /// In flight or queued.
-    Pending,
-    /// Finished successfully.
-    Downloaded,
-    /// Failed after exhausting retries.
-    Failed,
-}
-
-/// One row of the file history shown in the right-pane tabs.
-#[derive(Debug, Clone)]
-pub struct FileEntry {
-    /// Source-files row pulled from the database.
-    pub source: SourceFileRow,
-    /// Current outcome.
-    pub outcome: FileOutcome,
-    /// Last error message, if any.
-    pub error: Option<String>,
-    /// Bytes delivered (final on success, partial on pending/failed).
-    pub bytes: u64,
-}
 
 /// Right-pane tab the user is currently viewing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RunningTab {
-    /// Files currently in flight or queued.
+    /// Peak-count distribution across every parsed spectrum.
     #[default]
-    InFlight,
-    /// Successfully downloaded files.
-    Completed,
-    /// Failed files with their error messages.
-    Failed,
-    /// Log scrollback.
+    Peaks,
+    /// Precursor m/z distribution across MS2 spectra.
+    Pepmass,
+    /// Spectrum counts per precursor charge state.
+    Charge,
+    /// File counts per `(vendor, model)` pair.
+    Instrument,
+    /// Log scrollback (status messages, file failures).
     Log,
 }
 
 impl RunningTab {
     /// Ordered list of tabs cycled by `Tab` / `Shift+Tab`.
     #[must_use]
-    pub const fn all() -> [Self; 4] {
-        [Self::InFlight, Self::Completed, Self::Failed, Self::Log]
+    pub const fn all() -> [Self; 5] {
+        [
+            Self::Peaks,
+            Self::Pepmass,
+            Self::Charge,
+            Self::Instrument,
+            Self::Log,
+        ]
     }
 
     /// Title shown in the [`ratatui::widgets::Tabs`] header.
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
-            Self::InFlight => "In flight",
-            Self::Completed => "Completed",
-            Self::Failed => "Failed",
+            Self::Peaks => "Peaks",
+            Self::Pepmass => "Pepmass",
+            Self::Charge => "Charge",
+            Self::Instrument => "Instrument",
             Self::Log => "Log",
         }
     }
@@ -116,8 +102,8 @@ pub struct App {
     pub current_delivered: u64,
     /// Cumulative bytes credited to the aggregate-bytes total.
     pub aggregate_bytes: u64,
-    /// File-history ring buffer.
-    pub files: VecDeque<FileEntry>,
+    /// Latest snapshot from the spectrum aggregator.
+    pub aggregates: AggregateSnapshot,
     /// Log scrollback.
     pub logs: VecDeque<String>,
     /// Currently selected right-pane tab.
@@ -134,7 +120,7 @@ impl App {
     /// Builds a fresh application with the default tab selection.
     fn new() -> Self {
         Self {
-            tab: RunningTab::InFlight,
+            tab: RunningTab::Peaks,
             ..Self::default()
         }
     }
@@ -180,8 +166,9 @@ impl App {
         self.tab = tabs[next];
     }
 
-    /// Handles one progress event from the download path.
-    pub fn on_progress_event(&mut self, event: ProgressEvent) {
+    /// Handles one progress event from the download path. When a file
+    /// completes, a job is sent to the spectrum aggregator over `aggregator`.
+    pub fn on_progress_event(&mut self, event: ProgressEvent, aggregator: &Sender<AggregatorJob>) {
         match event {
             ProgressEvent::Log(message) => self.push_log(message),
             ProgressEvent::DownloadStarted {
@@ -199,12 +186,6 @@ impl App {
                 self.current_expected_bytes = u64::try_from(row.size_bytes).unwrap_or(0);
                 self.current_delivered = 0;
                 self.in_flight_high_water = 0;
-                self.push_file(FileEntry {
-                    source: row.clone(),
-                    outcome: FileOutcome::Pending,
-                    error: None,
-                    bytes: 0,
-                });
                 self.current = Some(row);
             }
             ProgressEvent::FileAlreadyPresent { bytes } => {
@@ -228,24 +209,23 @@ impl App {
                 self.credit_in_flight(delivered);
             }
             ProgressEvent::AttemptFinished => {}
-            ProgressEvent::FileFinished { bytes, .. } => {
+            ProgressEvent::FileFinished { local_path, bytes } => {
                 self.current_delivered = bytes;
                 self.credit_in_flight(bytes);
                 self.downloaded = self.downloaded.saturating_add(1);
                 self.remaining = self.remaining.saturating_sub(1);
-                if let Some(last) = self.files.back_mut() {
-                    last.outcome = FileOutcome::Downloaded;
-                    last.bytes = bytes;
+                if let Some(row) = self.current.take() {
+                    self.push_log(format!("downloaded: {}", row.filepath));
+                    drop(aggregator.send(AggregatorJob {
+                        local_path,
+                        instrument_vendor: row.instrument_vendor,
+                        instrument_model: row.instrument_model,
+                    }));
                 }
-                self.current = None;
             }
             ProgressEvent::FileFailed { filepath, error } => {
                 self.failed = self.failed.saturating_add(1);
                 self.remaining = self.remaining.saturating_sub(1);
-                if let Some(last) = self.files.back_mut() {
-                    last.outcome = FileOutcome::Failed;
-                    last.error = Some(error.clone());
-                }
                 self.push_log(format!("download failed: {filepath} | {error}"));
                 self.current = None;
             }
@@ -254,6 +234,14 @@ impl App {
                 self.failed = failed;
                 self.download_done = true;
             }
+        }
+    }
+
+    /// Handles one update from the spectrum aggregator.
+    pub fn on_aggregate_event(&mut self, event: AggregateEvent) {
+        match event {
+            AggregateEvent::Snapshot(snapshot) => self.aggregates = *snapshot,
+            AggregateEvent::Error(message) => self.push_log(message),
         }
     }
 
@@ -273,14 +261,6 @@ impl App {
             self.logs.pop_front();
         }
         self.logs.push_back(line);
-    }
-
-    /// Appends a file row, evicting the oldest when at capacity.
-    fn push_file(&mut self, entry: FileEntry) {
-        if self.files.len() >= MAX_FILE_ROWS {
-            self.files.pop_front();
-        }
-        self.files.push_back(entry);
     }
 }
 
@@ -310,6 +290,7 @@ async fn run_loop(
     filter: &DownloadFilter,
 ) -> Result<()> {
     let (sink, mut rx) = ProgressSink::channel();
+    let mut aggregator = aggregator::spawn().context("failed to spawn spectrum aggregator")?;
     let download = async move { download_pending_mzml(db, config, &sink, filter).await };
     let mut download = pin!(download);
 
@@ -332,7 +313,10 @@ async fn run_loop(
                 terminal.draw(|frame| running::render(frame, &app))?;
             }
             Some(event) = rx.recv() => {
-                app.on_progress_event(event);
+                app.on_progress_event(event, &aggregator.tx_jobs);
+            }
+            Some(event) = aggregator.rx_updates.recv() => {
+                app.on_aggregate_event(event);
             }
             Some(Ok(event)) = events.next() => {
                 app.on_terminal_event(&event);
@@ -350,7 +334,9 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, FileOutcome, RunningTab};
+    use std::sync::mpsc;
+
+    use super::{App, RunningTab};
     use crate::db::{DownloadProgressTotals, SourceFileRow};
     use crate::progress_sink::ProgressEvent;
 
@@ -376,15 +362,17 @@ mod tests {
     #[test]
     fn tab_cycles_forwards_and_backwards() {
         let mut app = App::new();
-        assert_eq!(app.tab, RunningTab::InFlight);
+        assert_eq!(app.tab, RunningTab::Peaks);
         app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::Completed);
+        assert_eq!(app.tab, RunningTab::Pepmass);
         app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::Failed);
+        assert_eq!(app.tab, RunningTab::Charge);
+        app.advance_tab(1);
+        assert_eq!(app.tab, RunningTab::Instrument);
         app.advance_tab(1);
         assert_eq!(app.tab, RunningTab::Log);
         app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::InFlight);
+        assert_eq!(app.tab, RunningTab::Peaks);
         app.advance_tab(-1);
         assert_eq!(app.tab, RunningTab::Log);
     }
@@ -392,46 +380,58 @@ mod tests {
     /// Confirms aggregate bytes only advance by per-file deltas across retries.
     #[test]
     fn aggregate_bytes_dedup_across_retries() {
+        let (tx, _rx) = mpsc::channel();
         let mut app = App::new();
-        app.on_progress_event(ProgressEvent::DownloadStarted {
-            totals: DownloadProgressTotals {
-                planned_files: 1,
-                planned_bytes: 1_000,
-                completed_files: 0,
-                completed_bytes: 0,
+        app.on_progress_event(
+            ProgressEvent::DownloadStarted {
+                totals: DownloadProgressTotals {
+                    planned_files: 1,
+                    planned_bytes: 1_000,
+                    completed_files: 0,
+                    completed_bytes: 0,
+                },
+                remaining_indexed: 1,
             },
-            remaining_indexed: 1,
-        });
-        app.on_progress_event(ProgressEvent::FileStarted {
-            source: Box::new(dummy_row("a.mzML", 1_000)),
-        });
-        app.on_progress_event(ProgressEvent::AttemptStarted {
-            attempt: 1,
-            expected_bytes: 1_000,
-            resume_offset: 0,
-        });
-        app.on_progress_event(ProgressEvent::FileBytes { delivered: 400 });
+            &tx,
+        );
+        app.on_progress_event(
+            ProgressEvent::FileStarted {
+                source: Box::new(dummy_row("a.mzML", 1_000)),
+            },
+            &tx,
+        );
+        app.on_progress_event(
+            ProgressEvent::AttemptStarted {
+                attempt: 1,
+                expected_bytes: 1_000,
+                resume_offset: 0,
+            },
+            &tx,
+        );
+        app.on_progress_event(ProgressEvent::FileBytes { delivered: 400 }, &tx);
         assert_eq!(app.aggregate_bytes, 400);
         // attempt 1 fails halfway, attempt 2 starts from 0
-        app.on_progress_event(ProgressEvent::AttemptStarted {
-            attempt: 2,
-            expected_bytes: 1_000,
-            resume_offset: 0,
-        });
-        app.on_progress_event(ProgressEvent::FileBytes { delivered: 200 });
+        app.on_progress_event(
+            ProgressEvent::AttemptStarted {
+                attempt: 2,
+                expected_bytes: 1_000,
+                resume_offset: 0,
+            },
+            &tx,
+        );
+        app.on_progress_event(ProgressEvent::FileBytes { delivered: 200 }, &tx);
         // 200 is below the 400 high water, so aggregate stays put
         assert_eq!(app.aggregate_bytes, 400);
-        app.on_progress_event(ProgressEvent::FileBytes { delivered: 1_000 });
+        app.on_progress_event(ProgressEvent::FileBytes { delivered: 1_000 }, &tx);
         assert_eq!(app.aggregate_bytes, 1_000);
-        app.on_progress_event(ProgressEvent::FileFinished {
-            local_path: std::path::PathBuf::from("/tmp/a"),
-            bytes: 1_000,
-        });
+        app.on_progress_event(
+            ProgressEvent::FileFinished {
+                local_path: std::path::PathBuf::from("/tmp/a"),
+                bytes: 1_000,
+            },
+            &tx,
+        );
         assert_eq!(app.aggregate_bytes, 1_000);
         assert_eq!(app.downloaded, 1);
-        assert_eq!(
-            app.files.back().map(|entry| entry.outcome),
-            Some(FileOutcome::Downloaded)
-        );
     }
 }

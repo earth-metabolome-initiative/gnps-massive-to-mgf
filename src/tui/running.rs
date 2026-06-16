@@ -4,9 +4,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{BarChart, Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
 
-use crate::tui::{App, FileEntry, FileOutcome, RunningTab};
+use crate::aggregator::{AggregateSnapshot, Histogram};
+use crate::tui::{App, RunningTab};
 
 /// Renders the running screen onto `frame`.
 pub fn render(frame: &mut Frame, app: &App) {
@@ -174,7 +175,10 @@ fn render_right(frame: &mut Frame, area: Rect, app: &App) {
         .collect::<Vec<_>>();
     let selected = tabs.iter().position(|tab| *tab == app.tab).unwrap_or(0);
     let header = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Aggregates (files parsed: {})",
+            app.aggregates.files_parsed
+        )))
         .select(selected)
         .highlight_style(
             Style::default()
@@ -185,58 +189,189 @@ fn render_right(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(header, chunks[0]);
 
     match app.tab {
-        RunningTab::InFlight => render_file_list(
+        RunningTab::Peaks => render_histogram_tab(
             frame,
             chunks[1],
-            app.files
-                .iter()
-                .filter(|entry| entry.outcome == FileOutcome::Pending),
-            "queued / in flight",
+            "peaks per spectrum",
+            "peaks",
+            &app.aggregates.peaks,
         ),
-        RunningTab::Completed => render_file_list(
+        RunningTab::Pepmass => render_histogram_tab(
             frame,
             chunks[1],
-            app.files
-                .iter()
-                .filter(|entry| entry.outcome == FileOutcome::Downloaded),
-            "completed",
+            "precursor m/z (MS2)",
+            "m/z",
+            &app.aggregates.pepmass,
         ),
-        RunningTab::Failed => render_file_list(
-            frame,
-            chunks[1],
-            app.files
-                .iter()
-                .filter(|entry| entry.outcome == FileOutcome::Failed),
-            "failed",
-        ),
+        RunningTab::Charge => render_charge_tab(frame, chunks[1], &app.aggregates),
+        RunningTab::Instrument => render_instrument_tab(frame, chunks[1], &app.aggregates),
         RunningTab::Log => render_log(frame, chunks[1], app),
     }
 }
 
-/// Renders a vertical list of file entries.
-fn render_file_list<'a, I>(frame: &mut Frame, area: Rect, entries: I, title: &str)
-where
-    I: Iterator<Item = &'a FileEntry>,
-{
+/// Renders a histogram tab: summary line on top, bar chart underneath.
+fn render_histogram_tab(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    unit_label: &str,
+    histogram: &Histogram,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title.to_owned());
-    let items: Vec<ListItem<'_>> = entries
-        .map(|entry| {
-            let (marker, style) = match entry.outcome {
-                FileOutcome::Pending => ("…", Style::default().fg(Color::Yellow)),
-                FileOutcome::Downloaded => ("✓", Style::default().fg(Color::Green)),
-                FileOutcome::Failed => ("✗", Style::default().fg(Color::Red)),
-            };
-            let suffix = entry.error.as_deref().map_or_else(
-                || format_bytes(entry.bytes),
-                |error| format!("{} ({error})", format_bytes(entry.bytes)),
-            );
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{marker} "), style),
-                Span::raw(format!("{} ", entry.source.filepath)),
-                Span::styled(suffix, Style::default().fg(Color::DarkGray)),
-            ]))
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if histogram.count == 0 {
+        let paragraph = Paragraph::new(Span::styled(
+            "(waiting for first parsed spectrum)",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(paragraph, inner);
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(inner);
+
+    let mean = histogram.mean;
+    let p25 = histogram.quantile(0.25).unwrap_or(0.0);
+    let median = histogram.quantile(0.5).unwrap_or(0.0);
+    let p75 = histogram.quantile(0.75).unwrap_or(0.0);
+    let p95 = histogram.quantile(0.95).unwrap_or(0.0);
+    let summary = vec![
+        Line::from(format!(
+            "count = {count}    mean = {mean:.2} {unit_label}    min = {min:.2}    max = {max:.2}",
+            count = histogram.count,
+            min = histogram.min,
+            max = histogram.max,
+        )),
+        Line::from(format!(
+            "p25 = {p25:.2}    median = {median:.2}    p75 = {p75:.2}    p95 = {p95:.2}"
+        )),
+    ];
+    let paragraph = Paragraph::new(summary).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, rows[0]);
+
+    render_bar_chart(frame, rows[1], histogram);
+}
+
+/// Renders a `ratatui::widgets::BarChart` from a histogram.
+fn render_bar_chart(frame: &mut Frame, area: Rect, histogram: &Histogram) {
+    let labels: Vec<String> = bucket_labels(histogram);
+    let data: Vec<(&str, u64)> = labels
+        .iter()
+        .zip(histogram.buckets.iter())
+        .map(|(label, value)| (label.as_str(), *value))
+        .collect();
+    let chart = BarChart::default()
+        .block(Block::default().borders(Borders::TOP).title("distribution"))
+        .bar_width(4)
+        .bar_gap(1)
+        .data(&data)
+        .bar_style(Style::default().fg(Color::Cyan))
+        .value_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(chart, area);
+}
+
+/// Bucket midpoint labels for the bar chart.
+fn bucket_labels(histogram: &Histogram) -> Vec<String> {
+    let n = histogram.buckets.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "labels are display-only; precision loss is fine"
+    )]
+    let span = (histogram_high(histogram) - histogram_low(histogram)) / n as f64;
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "labels are display-only, precision loss is fine"
+    )]
+    (0..n)
+        .map(|i| {
+            format!(
+                "{:.0}",
+                (i as f64 + 0.5).mul_add(span, histogram_low(histogram))
+            )
+        })
+        .collect()
+}
+
+/// Histogram lower bound (accessor wrapper to keep callers tidy).
+const fn histogram_low(_histogram: &Histogram) -> f64 {
+    0.0
+}
+
+/// Histogram upper bound (accessor wrapper to keep callers tidy).
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "labels are display-only, precision loss is fine"
+)]
+const fn histogram_high(histogram: &Histogram) -> f64 {
+    // The histogram never exposes its bucket bounds publicly to keep the
+    // surface small, so we reconstruct an upper bound from `max`.
+    histogram.max.max(histogram.buckets.len() as f64).max(1.0)
+}
+
+/// Renders the charge-state count tab.
+fn render_charge_tab(frame: &mut Frame, area: Rect, snapshot: &AggregateSnapshot) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("precursor charge counts (MS2)");
+    if snapshot.charges.is_empty() {
+        let paragraph = Paragraph::new(Span::styled(
+            "(waiting for first MS2 precursor)",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .block(block);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+    let items: Vec<ListItem<'_>> = snapshot
+        .charges
+        .iter()
+        .map(|(charge, count)| {
+            let sign = if *charge >= 0 { "+" } else { "" };
+            ListItem::new(Line::from(format!("{sign}{charge:>3}    {count}")))
+        })
+        .collect();
+    let list = List::new(items).block(block);
+    frame.render_widget(list, area);
+}
+
+/// Renders the instrument file-count tab.
+fn render_instrument_tab(frame: &mut Frame, area: Rect, snapshot: &AggregateSnapshot) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("file counts per (vendor, model)");
+    if snapshot.instruments.is_empty() {
+        let paragraph = Paragraph::new(Span::styled(
+            "(waiting for first parsed file)",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .block(block);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+    let mut rows: Vec<(&(String, String), &u64)> = snapshot.instruments.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1));
+    let items: Vec<ListItem<'_>> = rows
+        .into_iter()
+        .map(|((vendor, model), count)| {
+            ListItem::new(Line::from(format!("{count:>6}  {vendor} / {model}")))
         })
         .collect();
     let list = List::new(items).block(block);
