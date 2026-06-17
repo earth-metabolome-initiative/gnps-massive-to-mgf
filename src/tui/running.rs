@@ -6,7 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{BarChart, Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Bar, BarChart, BarGroup, Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap,
+};
 
 use crate::aggregator::{AggregateSnapshot, Histogram};
 use crate::tui::{App, InputMode, RunningTab};
@@ -388,16 +390,22 @@ fn render_histogram_tab(
 /// Renders a `ratatui::widgets::BarChart` from a histogram.
 fn render_bar_chart(frame: &mut Frame, area: Rect, histogram: &Histogram) {
     let labels: Vec<String> = bucket_labels(histogram);
-    let data: Vec<(&str, u64)> = labels
+    let bars: Vec<Bar<'_>> = labels
         .iter()
         .zip(histogram.buckets.iter())
-        .map(|(label, value)| (label.as_str(), *value))
+        .map(|(label, value)| {
+            Bar::default()
+                .value(*value)
+                .text_value(format_short_count(*value))
+                .label(Line::from(label.as_str()))
+        })
         .collect();
+    let group = BarGroup::default().bars(&bars);
     let chart = BarChart::default()
         .block(Block::default().borders(Borders::TOP).title("distribution"))
         .bar_width(4)
         .bar_gap(1)
-        .data(&data)
+        .data(group)
         .bar_style(Style::default().fg(Color::Cyan))
         .value_style(
             Style::default()
@@ -406,6 +414,41 @@ fn render_bar_chart(frame: &mut Frame, area: Rect, histogram: &Histogram) {
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_widget(chart, area);
+}
+
+/// Formats a non-negative count into a 4-character-or-shorter SI-suffixed
+/// string so it fits inside the [`BarChart`] bar even at `bar_width(4)`.
+/// Buckets under 1000 render as raw integers; thousands use `K`, millions
+/// `M`, billions `G`; fractional precision drops once the integer part hits
+/// two digits so the output never exceeds four glyphs.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "display-only formatting, lossy u64->f64 conversions are intentional"
+)]
+fn format_short_count(value: u64) -> String {
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    const G: u64 = 1_000_000_000;
+    if value < K {
+        return value.to_string();
+    }
+    if value < 10 * K {
+        return format!("{:.1}K", value as f64 / K as f64);
+    }
+    if value < M {
+        return format!("{}K", value / K);
+    }
+    if value < 10 * M {
+        return format!("{:.1}M", value as f64 / M as f64);
+    }
+    if value < G {
+        return format!("{}M", value / M);
+    }
+    if value < 10 * G {
+        return format!("{:.1}G", value as f64 / G as f64);
+    }
+    format!("{}G", value / G)
 }
 
 /// Bucket midpoint labels for the bar chart.
