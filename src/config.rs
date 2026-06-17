@@ -13,7 +13,7 @@ const DEFAULT_INDEX_DIR: &str = "data/openformats";
 /// Default dataset-level manifest mapping MSV accessions to FTPS volume buckets.
 const DEFAULT_MASSIVE_VOLUMES_PATH: &str = "public_MSVs_2026_0615_0812.tsv";
 /// Default SQLite state database.
-const DEFAULT_DATABASE_URL: &str = "data/gnps_massive_to_mgf.sqlite";
+const DEFAULT_DATABASE_URL: &str = "data/massive.sqlite";
 /// Default raw mzML download directory.
 const DEFAULT_MZML_DOWNLOAD_DIR: &str = "/mnt/bfd/mzml";
 /// Default generated MGF output directory.
@@ -25,7 +25,7 @@ const DEFAULT_TOP_K_PEAKS: usize = 256;
 /// Default number of spectra written per compressed MGF shard.
 const DEFAULT_MGF_SHARD_MAX_SPECTRA: u64 = 1_000_000;
 /// Default number of retry attempts for a source file download.
-const DEFAULT_DOWNLOAD_RETRY_ATTEMPTS: usize = 5;
+const DEFAULT_DOWNLOAD_RETRY_ATTEMPTS: usize = 1;
 /// Default delay between retryable download failures.
 const DEFAULT_DOWNLOAD_RETRY_DELAY_SECONDS: u64 = 30;
 /// Default FTPS host for MassIVE bulk downloads.
@@ -38,6 +38,14 @@ const DEFAULT_FTPS_CERT_PIN_PATH: &str = "data/ftps_cert_pin.txt";
 const DEFAULT_FTPS_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 /// Default FTPS transfer (per-file) timeout.
 const DEFAULT_FTPS_TRANSFER_TIMEOUT_SECONDS: u64 = 600;
+/// Default FTPS per-chunk read timeout. A stall longer than this fails the
+/// current attempt so the downloader can REST-resume from the `.part` file
+/// instead of waiting out the whole-transfer timeout.
+const DEFAULT_FTPS_CHUNK_READ_TIMEOUT_SECONDS: u64 = 15;
+/// Default cooldown applied to `download_failed` rows before they are eligible
+/// to retry. Keeps a `download` invocation from immediately reattempting files
+/// that just failed (likely server-side broken or in a per-IP cool-down).
+const DEFAULT_DOWNLOAD_FAILURE_COOLDOWN_SECONDS: u64 = 86_400;
 /// Default source selection buffer over the requested final unique target.
 const DEFAULT_SOURCE_SELECTION_BUFFER: f64 = 1.25;
 /// Default extra indexed MS/MS spectra promoted when the unique target is short.
@@ -88,6 +96,15 @@ pub struct Config {
     pub ftps_connect_timeout: Duration,
     /// FTPS per-file transfer timeout; `None` disables it.
     pub ftps_transfer_timeout: Option<Duration>,
+    /// FTPS per-chunk read timeout applied around each
+    /// `data.read(&mut buf).await` inside the transfer loop. `None` disables
+    /// it. Keeps a silent data-channel stall from waiting out the much larger
+    /// `ftps_transfer_timeout`.
+    pub ftps_chunk_read_timeout: Option<Duration>,
+    /// Cooldown applied to `download_failed` rows before they are re-queued
+    /// on the next `download` run. Recently-failed files skip the retry until
+    /// at least this duration has elapsed since their last attempt.
+    pub download_failure_cooldown: Duration,
 }
 
 impl Config {
@@ -159,6 +176,16 @@ impl Config {
             "FTPS_TRANSFER_TIMEOUT_SECONDS",
             DEFAULT_FTPS_TRANSFER_TIMEOUT_SECONDS,
         )?;
+        let ftps_chunk_read_timeout_seconds = parse_u64(
+            read_env,
+            "FTPS_CHUNK_READ_TIMEOUT_SECONDS",
+            DEFAULT_FTPS_CHUNK_READ_TIMEOUT_SECONDS,
+        )?;
+        let download_failure_cooldown_seconds = parse_u64(
+            read_env,
+            "DOWNLOAD_FAILURE_COOLDOWN_SECONDS",
+            DEFAULT_DOWNLOAD_FAILURE_COOLDOWN_SECONDS,
+        )?;
         let ftps_port_value = parse_u64(read_env, "FTPS_PORT", u64::from(DEFAULT_FTPS_PORT))?;
         let ftps_port = u16::try_from(ftps_port_value)
             .with_context(|| format!("FTPS_PORT {ftps_port_value} does not fit u16"))?;
@@ -218,6 +245,9 @@ impl Config {
             )?),
             ftps_transfer_timeout: (ftps_transfer_timeout_seconds > 0)
                 .then(|| Duration::from_secs(ftps_transfer_timeout_seconds)),
+            ftps_chunk_read_timeout: (ftps_chunk_read_timeout_seconds > 0)
+                .then(|| Duration::from_secs(ftps_chunk_read_timeout_seconds)),
+            download_failure_cooldown: Duration::from_secs(download_failure_cooldown_seconds),
         })
     }
 

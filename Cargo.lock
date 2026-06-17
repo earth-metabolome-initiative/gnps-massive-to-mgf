@@ -992,34 +992,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gnps-massive-to-mgf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "csv",
- "diesel",
- "dotenvy",
- "futures-util",
- "indicatif",
- "mascot-rs",
- "mzdata",
- "ratatui",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "suppaftp",
- "tempfile",
- "tokio",
- "tokio-util",
- "zenodo-rs 0.2.0",
- "zstd",
-]
-
-[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,6 +1633,34 @@ dependencies = [
  "num-traits",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "massive-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "csv",
+ "diesel",
+ "dotenvy",
+ "futures-util",
+ "indicatif",
+ "mascot-rs",
+ "mzdata",
+ "ratatui",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "suppaftp",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "zenodo-rs 0.2.0",
+ "zstd",
 ]
 
 [[package]]

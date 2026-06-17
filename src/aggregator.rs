@@ -2,14 +2,14 @@
 //!
 //! A dedicated OS thread parses freshly-downloaded mzML files with `mzdata`
 //! and accumulates running aggregates (peak counts, precursor m/z, charges,
-//! per-instrument file counts). The TUI consumes [`AggregateEvent`]s from a
-//! tokio mpsc receiver and re-renders on its normal tick cadence. The thread
-//! is single-purpose, so `mzdata`'s synchronous parsing never blocks the
-//! event loop or the FTPS download future.
+//! per-instrument file counts). The TUI consumes `AggregateEvent` values
+//! from a tokio mpsc receiver and re-renders on its normal tick cadence.
+//! The thread is single-purpose, so `mzdata`'s synchronous parsing never
+//! blocks the event loop or the FTPS download future.
 //!
-//! The TUI hands files in by sending [`AggregatorJob`]s on a `std::sync::mpsc`
-//! channel. Dropping the [`AggregatorHandle`] closes the channel, which the
-//! worker treats as a clean shutdown.
+//! The TUI hands files in by sending `AggregatorJob` values on a
+//! `std::sync::mpsc` channel. Dropping the `AggregatorHandle` closes the
+//! channel, which the worker treats as a clean shutdown.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ use anyhow::Context;
 use mzdata::MzMLReader;
 use mzdata::io::MZFileReader;
 use mzdata::prelude::{IonProperties, PrecursorSelection, SpectrumLike};
+use mzdata::spectrum::ScanPolarity;
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// Number of histogram buckets used for peak-count and pepmass distributions.
@@ -28,6 +29,8 @@ const HISTOGRAM_BUCKETS: usize = 50;
 const PEAK_COUNT_HIGH: f64 = 5_000.0;
 /// Upper bound (exclusive) of the pepmass histogram in m/z.
 const PEPMASS_HIGH: f64 = 2_000.0;
+/// Upper bound (exclusive) of the MS2-per-file histogram.
+const MS2_PER_FILE_HIGH: f64 = 100_000.0;
 
 /// One downloaded file handed to the aggregator.
 #[derive(Debug, Clone)]
@@ -66,6 +69,12 @@ pub struct AggregateSnapshot {
     pub charges: BTreeMap<i32, u64>,
     /// File counts per `(vendor, model)` pair.
     pub instruments: BTreeMap<(String, String), u64>,
+    /// One data point per parsed file: the number of MS2 spectra it contains.
+    pub ms2_per_file: Histogram,
+    /// Per-spectrum polarity counts (`positive`, `negative`, `unknown`).
+    pub polarities: BTreeMap<String, u64>,
+    /// Per-MS2-spectrum dissociation-method counts (`HigherEnergy...`, etc.).
+    pub activations: BTreeMap<String, u64>,
 }
 
 impl Default for AggregateSnapshot {
@@ -78,6 +87,9 @@ impl Default for AggregateSnapshot {
             pepmass: Histogram::new(0.0, PEPMASS_HIGH, HISTOGRAM_BUCKETS),
             charges: BTreeMap::new(),
             instruments: BTreeMap::new(),
+            ms2_per_file: Histogram::new(0.0, MS2_PER_FILE_HIGH, HISTOGRAM_BUCKETS),
+            polarities: BTreeMap::new(),
+            activations: BTreeMap::new(),
         }
     }
 }
@@ -251,6 +263,7 @@ fn run(rx: &mpsc::Receiver<AggregatorJob>, tx: &tokio_mpsc::UnboundedSender<Aggr
 fn process_file(job: &AggregatorJob, state: &mut AggregateSnapshot) -> anyhow::Result<()> {
     let mut reader = MzMLReader::open_path(&job.local_path)
         .with_context(|| format!("failed to open {}", job.local_path.display()))?;
+    let mut file_ms2_count: u64 = 0;
     #[allow(
         clippy::as_conversions,
         clippy::cast_precision_loss,
@@ -262,28 +275,51 @@ fn process_file(job: &AggregatorJob, state: &mut AggregateSnapshot) -> anyhow::R
             let peak_count = spectrum.peaks().iter().count();
             state.peaks.add(peak_count as f64);
         }
+        let polarity_label = match spectrum.polarity() {
+            ScanPolarity::Positive => "positive",
+            ScanPolarity::Negative => "negative",
+            ScanPolarity::Unknown => "unknown",
+        };
+        increment_label(&mut state.polarities, polarity_label);
         if spectrum.ms_level() != 2 {
             continue;
         }
         state.ms2_total = state.ms2_total.saturating_add(1);
-        if let Some(precursor) = spectrum.precursor()
-            && let Some(ion) = precursor.ion()
-        {
-            let mz = ion.mz();
-            if mz.is_finite() && mz > 0.0 {
-                state.pepmass.add(mz);
+        file_ms2_count = file_ms2_count.saturating_add(1);
+        if let Some(precursor) = spectrum.precursor() {
+            if let Some(method) = precursor.activation().method() {
+                increment_label(&mut state.activations, &format!("{method:?}"));
             }
-            if let Some(charge) = ion.charge() {
-                *state.charges.entry(charge).or_insert(0) = state
-                    .charges
-                    .get(&charge)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(1);
+            if let Some(ion) = precursor.ion() {
+                let mz = ion.mz();
+                if mz.is_finite() && mz > 0.0 {
+                    state.pepmass.add(mz);
+                }
+                if let Some(charge) = ion.charge() {
+                    *state.charges.entry(charge).or_insert(0) = state
+                        .charges
+                        .get(&charge)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                }
             }
         }
     }
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "MS2-per-file is bounded by parsed spectra count; lossy display-only cast"
+    )]
+    state.ms2_per_file.add(file_ms2_count as f64);
     Ok(())
+}
+
+/// Increments the counter associated with `label` in `map`, inserting `1` on
+/// first sight.
+fn increment_label(map: &mut BTreeMap<String, u64>, label: &str) {
+    let next = map.get(label).copied().unwrap_or(0).saturating_add(1);
+    map.insert(label.to_owned(), next);
 }
 
 #[cfg(test)]

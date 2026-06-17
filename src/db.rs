@@ -548,19 +548,31 @@ WHERE status IN ('downloaded', 'indexed', 'download_failed')
         })
     }
 
-    /// Moves previous failed downloads back to the indexed queue for a new run.
+    /// Moves previously-failed downloads back to the indexed queue when their
+    /// last attempt is older than `cooldown_seconds`.
+    ///
+    /// Recently-failed rows are left as `download_failed` so a server-side
+    /// outage or a known-bad file does not waste new retries on every run.
+    /// Pass `0` to reset every failed row regardless of age (matches the
+    /// original behavior).
     ///
     /// # Errors
     ///
-    /// Returns an error if SQLite rejects the update.
-    pub fn reset_download_failures(&mut self) -> anyhow::Result<u64> {
+    /// Returns an error if SQLite rejects the update or the cooldown does
+    /// not fit `i64`.
+    pub fn reset_download_failures(&mut self, cooldown_seconds: u64) -> anyhow::Result<u64> {
+        let cooldown_seconds =
+            i64::try_from(cooldown_seconds).context("failure cooldown does not fit i64")?;
         let updated = sql_query(
             "\
 UPDATE source_files
 SET status = 'indexed', updated_at = CURRENT_TIMESTAMP
 WHERE status = 'download_failed'
+  AND CAST(strftime('%s', 'now') AS INTEGER)
+      - CAST(strftime('%s', updated_at) AS INTEGER) >= ?
 ",
         )
+        .bind::<BigInt, _>(cooldown_seconds)
         .execute(&mut self.connection)
         .context("failed to reset failed downloads")?;
         u64::try_from(updated).context("reset count does not fit u64")
@@ -697,6 +709,37 @@ WHERE filepath = ?
         .bind::<Text, _>(filepath)
         .execute(&mut self.connection)
         .context("failed to mark source file downloaded")?;
+        Ok(())
+    }
+
+    /// Overwrites the indexed `size_bytes` for one source file.
+    ///
+    /// Used when the FTPS server's `SIZE` response disagrees with the
+    /// openformats TSV so future runs do not re-discover the discrepancy. The
+    /// row's status is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the update or the byte count does
+    /// not fit `i64`.
+    pub fn update_source_size_bytes(
+        &mut self,
+        filepath: &str,
+        size_bytes: u64,
+    ) -> anyhow::Result<()> {
+        let size_bytes =
+            i64::try_from(size_bytes).context("server-reported size does not fit i64")?;
+        sql_query(
+            "\
+UPDATE source_files
+SET size_bytes = ?, updated_at = CURRENT_TIMESTAMP
+WHERE filepath = ?
+",
+        )
+        .bind::<BigInt, _>(size_bytes)
+        .bind::<Text, _>(filepath)
+        .execute(&mut self.connection)
+        .context("failed to update source file size")?;
         Ok(())
     }
 

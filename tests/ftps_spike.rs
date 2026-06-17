@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, anyhow};
-use gnps_massive_to_mgf::ftps_tofu::{TofuCertVerifier, rustls_config};
+use massive::ftps_tofu::{TofuCertVerifier, rustls_config};
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
 use suppaftp::tokio_rustls::TlsConnector;
 use suppaftp::types::FileType;

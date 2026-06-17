@@ -10,21 +10,24 @@
 //! file persists for FTP `REST` resume on the next run).
 
 use std::collections::VecDeque;
+use std::fs;
 use std::io::Stdout;
 use std::io::stdout;
+use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 
 use crate::aggregator::{self, AggregateEvent, AggregateSnapshot, AggregatorJob};
 use crate::config::Config;
@@ -38,6 +41,13 @@ pub mod running;
 const MAX_LOG_LINES: usize = 256;
 /// Render tick cadence. ~12 fps is plenty for FTPS throughput.
 const TICK_RATE: Duration = Duration::from_millis(80);
+/// Number of log lines scrolled by one mouse-wheel turn (terminal convention).
+const MOUSE_WHEEL_STEP: usize = 3;
+
+/// Returns whether `rect` covers the given `(column, row)` cell.
+const fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
 
 /// Right-pane tab the user is currently viewing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -45,24 +55,47 @@ pub enum RunningTab {
     /// Peak-count distribution across every parsed spectrum.
     #[default]
     Peaks,
+    /// Distribution of MS2-spectrum count per file.
+    Ms2PerFile,
     /// Precursor m/z distribution across MS2 spectra.
     Pepmass,
     /// Spectrum counts per precursor charge state.
     Charge,
+    /// Spectrum counts per scan polarity.
+    Polarity,
+    /// MS2 spectrum counts per dissociation method.
+    Activation,
     /// File counts per `(vendor, model)` pair.
     Instrument,
     /// Log scrollback (status messages, file failures).
     Log,
 }
 
+/// Input handling mode.
+///
+/// The [`App`] is in [`Self::Normal`] while the user is browsing the running
+/// screen. Entering a popup such as the dump-log prompt switches to
+/// [`Self::DumpPathPrompt`] which redirects key presses into the buffer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputMode {
+    /// Normal navigation: tab switching, quit, copy, dump.
+    #[default]
+    Normal,
+    /// Modal text input for the "dump log to file" path prompt.
+    DumpPathPrompt,
+}
+
 impl RunningTab {
     /// Ordered list of tabs cycled by `Tab` / `Shift+Tab`.
     #[must_use]
-    pub const fn all() -> [Self; 5] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::Peaks,
+            Self::Ms2PerFile,
             Self::Pepmass,
             Self::Charge,
+            Self::Polarity,
+            Self::Activation,
             Self::Instrument,
             Self::Log,
         ]
@@ -72,9 +105,12 @@ impl RunningTab {
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
-            Self::Peaks => "Peaks",
+            Self::Peaks => "#Peaks",
+            Self::Ms2PerFile => "MS2/file",
             Self::Pepmass => "Pepmass",
             Self::Charge => "Charge",
+            Self::Polarity => "Polarity",
+            Self::Activation => "Activation",
             Self::Instrument => "Instrument",
             Self::Log => "Log",
         }
@@ -114,6 +150,29 @@ pub struct App {
     pub download_done: bool,
     /// High-water mark of bytes credited for the in-flight file.
     in_flight_high_water: u64,
+    /// Last (instant, bytes) sample used to compute the per-file rate EMA.
+    file_rate_sample: Option<(Instant, u64)>,
+    /// Last (instant, bytes) sample used to compute the aggregate rate EMA.
+    total_rate_sample: Option<(Instant, u64)>,
+    /// EMA of per-file bytes per second (None until two samples have arrived).
+    pub file_rate_bps: Option<f64>,
+    /// EMA of aggregate bytes per second (None until two samples have arrived).
+    pub total_rate_bps: Option<f64>,
+    /// Wall-clock instant of the last per-file byte advance.
+    pub last_file_advance_at: Option<Instant>,
+    /// Wall-clock instant of the last aggregate byte advance.
+    pub last_total_advance_at: Option<Instant>,
+    /// Current input mode; controls how key presses are dispatched.
+    pub input_mode: InputMode,
+    /// Buffer fed by [`InputMode::DumpPathPrompt`] characters.
+    pub dump_path_input: String,
+    /// Number of log lines hidden below the bottom of the visible window when
+    /// the user has scrolled up. `0` means "stay pinned to the newest line".
+    pub log_scroll_offset: usize,
+    /// Clickable rectangle for each right-pane tab header, populated by the
+    /// renderer each frame. Consumed by the mouse handler to map a click
+    /// position to a tab.
+    pub tab_rects: Vec<(RunningTab, Rect)>,
 }
 
 impl App {
@@ -127,30 +186,139 @@ impl App {
 
     /// Handles one terminal event.
     pub fn on_terminal_event(&mut self, event: &Event) {
-        if let Event::Key(KeyEvent {
-            code,
-            modifiers,
-            kind,
-            ..
-        }) = event
-        {
-            if *kind != KeyEventKind::Press {
-                return;
+        match event {
+            Event::Key(KeyEvent {
+                code,
+                modifiers,
+                kind,
+                ..
+            }) => {
+                if *kind != KeyEventKind::Press {
+                    return;
+                }
+                self.on_key(*code, *modifiers);
             }
-            self.on_key(*code, *modifiers);
+            Event::Mouse(mouse_event) => self.on_mouse(*mouse_event),
+            _ => {}
         }
     }
 
-    /// Dispatches a key press.
+    /// Handles one mouse event. Wired interactions:
+    ///
+    /// - Left click on a right-pane tab header switches to that tab.
+    /// - Wheel over the `Log` tab scrolls [`MOUSE_WHEEL_STEP`] lines per turn.
+    fn on_mouse(&mut self, event: MouseEvent) {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                for (tab, rect) in &self.tab_rects {
+                    if rect_contains(*rect, event.column, event.row) {
+                        self.tab = *tab;
+                        return;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp if self.tab == RunningTab::Log => {
+                self.log_scroll_offset = self.log_scroll_offset.saturating_add(MOUSE_WHEEL_STEP);
+                if self.log_scroll_offset > self.logs.len() {
+                    self.log_scroll_offset = self.logs.len();
+                }
+            }
+            MouseEventKind::ScrollDown if self.tab == RunningTab::Log => {
+                self.log_scroll_offset = self.log_scroll_offset.saturating_sub(MOUSE_WHEEL_STEP);
+            }
+            _ => {}
+        }
+    }
+
+    /// Dispatches a key press. The dispatch path depends on the current
+    /// [`InputMode`]: text-input modes consume the keystroke for the buffer,
+    /// while [`InputMode::Normal`] runs the global shortcut table.
     fn on_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match self.input_mode {
+            InputMode::DumpPathPrompt => self.on_key_dump_prompt(code),
+            InputMode::Normal => self.on_key_normal(code, modifiers),
+        }
+    }
+
+    /// Global shortcut handler used in [`InputMode::Normal`].
+    fn on_key_normal(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        if self.tab == RunningTab::Log && self.on_key_log_scroll(code) {
+            return;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit_requested = true,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quit_requested = true;
             }
+            KeyCode::Char('d') => {
+                self.dump_path_input.clear();
+                self.input_mode = InputMode::DumpPathPrompt;
+            }
             KeyCode::Tab | KeyCode::Right => self.advance_tab(1),
             KeyCode::BackTab | KeyCode::Left => self.advance_tab(-1),
             _ => {}
+        }
+    }
+
+    /// Handles scroll keys while the `Log` tab is active. Returns `true` when
+    /// the key was a scroll action so the global shortcut table is skipped.
+    fn on_key_log_scroll(&mut self, code: KeyCode) -> bool {
+        const PAGE: usize = 10;
+        match code {
+            KeyCode::Up => self.log_scroll_offset = self.log_scroll_offset.saturating_add(1),
+            KeyCode::Down => self.log_scroll_offset = self.log_scroll_offset.saturating_sub(1),
+            KeyCode::PageUp => self.log_scroll_offset = self.log_scroll_offset.saturating_add(PAGE),
+            KeyCode::PageDown => {
+                self.log_scroll_offset = self.log_scroll_offset.saturating_sub(PAGE);
+            }
+            KeyCode::Home => self.log_scroll_offset = self.logs.len(),
+            KeyCode::End => self.log_scroll_offset = 0,
+            _ => return false,
+        }
+        if self.log_scroll_offset > self.logs.len() {
+            self.log_scroll_offset = self.logs.len();
+        }
+        true
+    }
+
+    /// Key handler used while the dump-path prompt is open.
+    fn on_key_dump_prompt(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.dump_path_input.clear();
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Enter => {
+                let path = std::mem::take(&mut self.dump_path_input);
+                self.input_mode = InputMode::Normal;
+                self.dump_log_to_file(path.trim());
+            }
+            KeyCode::Backspace => {
+                self.dump_path_input.pop();
+            }
+            KeyCode::Char(character) => {
+                self.dump_path_input.push(character);
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes the in-memory log to `path` (one line per record, no trailing
+    /// newline). Reports the outcome back to the user via [`Self::push_log`].
+    fn dump_log_to_file(&mut self, path: &str) {
+        if path.is_empty() {
+            self.push_log("dump cancelled: empty path".to_owned());
+            return;
+        }
+        let path = PathBuf::from(path);
+        let payload = self.logs.iter().cloned().collect::<Vec<_>>().join("\n");
+        let line_count = self.logs.len();
+        match fs::write(&path, &payload) {
+            Ok(()) => self.push_log(format!(
+                "wrote {line_count} log line(s) to {}",
+                path.display(),
+            )),
+            Err(error) => self.push_log(format!("failed to write {}: {error}", path.display())),
         }
     }
 
@@ -186,6 +354,9 @@ impl App {
                 self.current_expected_bytes = u64::try_from(row.size_bytes).unwrap_or(0);
                 self.current_delivered = 0;
                 self.in_flight_high_water = 0;
+                self.file_rate_sample = None;
+                self.file_rate_bps = None;
+                self.last_file_advance_at = Some(Instant::now());
                 self.current = Some(row);
             }
             ProgressEvent::FileAlreadyPresent { bytes } => {
@@ -201,12 +372,25 @@ impl App {
                 self.current_expected_bytes = expected_bytes;
                 self.current_delivered = resume_offset;
                 self.credit_in_flight(resume_offset);
+                // A new attempt restarts from `resume_offset`, so the rate
+                // sample taken before the restart is no longer comparable.
+                self.file_rate_sample = None;
+                self.last_file_advance_at = Some(Instant::now());
             }
             ProgressEvent::FileBytes { delivered } => {
-                if delivered > self.current_delivered {
+                let advanced = delivered > self.current_delivered;
+                if advanced {
                     self.current_delivered = delivered;
                 }
+                let prior_total = self.aggregate_bytes;
                 self.credit_in_flight(delivered);
+                let now = Instant::now();
+                if advanced {
+                    self.last_file_advance_at = Some(now);
+                }
+                if self.aggregate_bytes > prior_total {
+                    self.last_total_advance_at = Some(now);
+                }
             }
             ProgressEvent::AttemptFinished => {}
             ProgressEvent::FileFinished { local_path, bytes } => {
@@ -242,6 +426,46 @@ impl App {
         match event {
             AggregateEvent::Snapshot(snapshot) => self.aggregates = *snapshot,
             AggregateEvent::Error(message) => self.push_log(message),
+        }
+    }
+
+    /// Refreshes the per-file and aggregate throughput EMAs from the current
+    /// byte counters. Intended to be called once per render tick.
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "bytes/sec math is descriptive; lossy u64 to f64 conversions are fine here"
+    )]
+    pub fn update_rates(&mut self, now: Instant) {
+        const ALPHA: f64 = 0.3;
+        const MIN_INTERVAL: Duration = Duration::from_millis(250);
+        if let Some((then, bytes)) = self.file_rate_sample {
+            if now.duration_since(then) >= MIN_INTERVAL {
+                let dt = now.duration_since(then).as_secs_f64();
+                let delta = self.current_delivered.saturating_sub(bytes) as f64;
+                let instant = if dt > 0.0 { delta / dt } else { 0.0 };
+                self.file_rate_bps = Some(
+                    self.file_rate_bps
+                        .map_or(instant, |prev| ALPHA.mul_add(instant, (1.0 - ALPHA) * prev)),
+                );
+                self.file_rate_sample = Some((now, self.current_delivered));
+            }
+        } else {
+            self.file_rate_sample = Some((now, self.current_delivered));
+        }
+        if let Some((then, bytes)) = self.total_rate_sample {
+            if now.duration_since(then) >= MIN_INTERVAL {
+                let dt = now.duration_since(then).as_secs_f64();
+                let delta = self.aggregate_bytes.saturating_sub(bytes) as f64;
+                let instant = if dt > 0.0 { delta / dt } else { 0.0 };
+                self.total_rate_bps = Some(
+                    self.total_rate_bps
+                        .map_or(instant, |prev| ALPHA.mul_add(instant, (1.0 - ALPHA) * prev)),
+                );
+                self.total_rate_sample = Some((now, self.aggregate_bytes));
+            }
+        } else {
+            self.total_rate_sample = Some((now, self.aggregate_bytes));
         }
     }
 
@@ -310,7 +534,8 @@ async fn run_loop(
         tokio::select! {
             biased;
             _ = ticker.tick() => {
-                terminal.draw(|frame| running::render(frame, &app))?;
+                app.update_rates(Instant::now());
+                terminal.draw(|frame| running::render(frame, &mut app))?;
             }
             Some(event) = rx.recv() => {
                 app.on_progress_event(event, &aggregator.tx_jobs);
@@ -328,7 +553,8 @@ async fn run_loop(
         }
     }
 
-    terminal.draw(|frame| running::render(frame, &app))?;
+    app.update_rates(Instant::now());
+    terminal.draw(|frame| running::render(frame, &mut app))?;
     download_result
 }
 
@@ -362,19 +588,16 @@ mod tests {
     #[test]
     fn tab_cycles_forwards_and_backwards() {
         let mut app = App::new();
-        assert_eq!(app.tab, RunningTab::Peaks);
+        let expected = RunningTab::all();
+        assert_eq!(app.tab, expected[0]);
+        for tab in &expected[1..] {
+            app.advance_tab(1);
+            assert_eq!(app.tab, *tab);
+        }
         app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::Pepmass);
-        app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::Charge);
-        app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::Instrument);
-        app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::Log);
-        app.advance_tab(1);
-        assert_eq!(app.tab, RunningTab::Peaks);
+        assert_eq!(app.tab, expected[0]);
         app.advance_tab(-1);
-        assert_eq!(app.tab, RunningTab::Log);
+        assert_eq!(app.tab, *expected.last().unwrap_or(&expected[0]));
     }
 
     /// Confirms aggregate bytes only advance by per-file deltas across retries.

@@ -523,6 +523,8 @@ MSV000000001\tv01\tNULL\tNULL
             ftps_cert_pin_path: root.join("ftps_cert_pin.txt"),
             ftps_connect_timeout: Duration::from_secs(1),
             ftps_transfer_timeout: None,
+            ftps_chunk_read_timeout: None,
+            download_failure_cooldown: Duration::from_secs(0),
         }
     }
 }

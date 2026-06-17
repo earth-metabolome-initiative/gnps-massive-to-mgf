@@ -44,6 +44,10 @@ pub struct FtpsDownloadBackend {
     connect_timeout: Duration,
     /// Optional per-file transfer timeout; `None` disables it.
     transfer_timeout: Option<Duration>,
+    /// Optional per-chunk read timeout applied inside the FTPS streaming
+    /// loop; `None` disables it. Catches silent data-channel stalls without
+    /// waiting out [`Self::transfer_timeout`].
+    chunk_read_timeout: Option<Duration>,
     /// rustls `ClientConfig` backed by the TOFU cert verifier.
     tls_config: Arc<rustls::ClientConfig>,
 }
@@ -63,11 +67,17 @@ impl FtpsDownloadBackend {
             port: config.ftps_port,
             connect_timeout: config.ftps_connect_timeout,
             transfer_timeout: config.ftps_transfer_timeout,
+            chunk_read_timeout: config.ftps_chunk_read_timeout,
             tls_config: Arc::new(tls_config),
         })
     }
 
     /// Opens a fresh authenticated FTPS session ready for binary transfer.
+    ///
+    /// The TLS upgrade and the post-connect FTP commands (`LOGIN`, `TYPE`)
+    /// are wrapped in [`Self::chunk_read_timeout`] so a server that accepts
+    /// the TCP connection but goes silent at the application layer cannot
+    /// stall the entire pipeline.
     async fn open(&self) -> anyhow::Result<AsyncRustlsFtpStream> {
         let connector = TlsConnector::from(Arc::clone(&self.tls_config));
         let host = &*self.host;
@@ -79,18 +89,37 @@ impl FtpsDownloadBackend {
         .await
         .with_context(|| format!("FTPS connect to {host}:{port} timed out"))?
         .with_context(|| format!("failed to connect to {host}:{port}"))?;
-        let mut stream = stream
-            .into_secure(AsyncRustlsConnector::from(connector), host)
+        let command_timeout = self.chunk_read_timeout;
+        let mut stream = match command_timeout {
+            Some(timeout) => tokio::time::timeout(
+                timeout,
+                stream.into_secure(AsyncRustlsConnector::from(connector), host),
+            )
             .await
-            .context("failed to upgrade FTPS control channel to TLS")?;
-        stream
-            .login("anonymous", "anonymous@example.com")
-            .await
-            .context("anonymous FTPS login was refused")?;
-        stream
-            .transfer_type(FileType::Binary)
-            .await
-            .context("failed to set binary transfer type")?;
+            .with_context(|| format!("FTPS TLS upgrade did not respond in {timeout:?}"))?,
+            None => {
+                stream
+                    .into_secure(AsyncRustlsConnector::from(connector), host)
+                    .await
+            }
+        }
+        .context("failed to upgrade FTPS control channel to TLS")?;
+        let login = stream.login("anonymous", "anonymous@example.com");
+        match command_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, login)
+                .await
+                .with_context(|| format!("FTPS LOGIN did not respond in {timeout:?}"))?,
+            None => login.await,
+        }
+        .context("anonymous FTPS login was refused")?;
+        let type_call = stream.transfer_type(FileType::Binary);
+        match command_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, type_call)
+                .await
+                .with_context(|| format!("FTPS TYPE did not respond in {timeout:?}"))?,
+            None => type_call.await,
+        }
+        .context("failed to set binary transfer type")?;
         Ok(stream)
     }
 }
@@ -133,9 +162,12 @@ pub async fn download_pending_mzml_with_backend(
     backend: FtpsDownloadBackend,
     filter: &DownloadFilter,
 ) -> anyhow::Result<()> {
-    let reset = db.reset_download_failures()?;
+    let reset = db.reset_download_failures(config.download_failure_cooldown.as_secs())?;
     if reset > 0 {
-        sink.log(format!("retrying {reset} previously failed download(s)"));
+        sink.log(format!(
+            "retrying {reset} previously failed download(s) older than {:?}",
+            config.download_failure_cooldown,
+        ));
     }
     let missing_volume = db.count_missing_volume()?;
     if missing_volume > 0 {
@@ -167,6 +199,14 @@ pub async fn download_pending_mzml_with_backend(
         match download_with_retries(&backend, config, sink, &source).await {
             Ok(bytes) => {
                 downloaded = downloaded.saturating_add(1);
+                let indexed_bytes = u64::try_from(source.size_bytes).unwrap_or(0);
+                if bytes != indexed_bytes {
+                    sink.log(format!(
+                        "correcting indexed size for {}: was {indexed_bytes}, delivered {bytes}",
+                        source.filepath,
+                    ));
+                    db.update_source_size_bytes(&source.filepath, bytes)?;
+                }
                 db.mark_downloaded(&source.filepath, bytes)?;
                 sink.send(ProgressEvent::FileFinished {
                     local_path: source.local_path_buf(),
@@ -208,8 +248,19 @@ async fn download_with_retries(
         match download_once(backend, sink, source, attempt).await {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
+                sink.log(format!(
+                    "attempt {attempt} failed for {}: {error:#}",
+                    source.filepath,
+                ));
+                sink.send(ProgressEvent::AttemptFinished);
                 last_error = Some(error);
                 if attempt < config.download_retry_attempts {
+                    sink.log(format!(
+                        "sleeping {:?} before attempt {} for {}",
+                        config.download_retry_delay,
+                        attempt + 1,
+                        source.filepath,
+                    ));
                     tokio::time::sleep(config.download_retry_delay).await;
                 }
             }
@@ -235,7 +286,7 @@ async fn download_once(
     attempt: usize,
 ) -> anyhow::Result<u64> {
     let destination = source.local_path_buf();
-    let expected_bytes = u64::try_from(source.size_bytes).context("negative source size")?;
+    let indexed_bytes = u64::try_from(source.size_bytes).context("negative source size")?;
     let part_path = part_path(&destination);
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
@@ -243,7 +294,75 @@ async fn download_once(
     }
 
     let existing_part = partial_size(&part_path)?;
+    if existing_part == indexed_bytes {
+        fs::rename(&part_path, &destination).with_context(|| {
+            format!(
+                "failed to rename complete partial {} to {}",
+                part_path.display(),
+                destination.display()
+            )
+        })?;
+        sink.send(ProgressEvent::AttemptStarted {
+            attempt,
+            expected_bytes: indexed_bytes,
+            resume_offset: indexed_bytes,
+        });
+        sink.send(ProgressEvent::AttemptFinished);
+        return Ok(indexed_bytes);
+    }
+
+    let volume = source
+        .volume
+        .as_deref()
+        .with_context(|| format!("source file {} has no FTPS volume mapping", source.filepath))?;
+    let server_path = format!("/{volume}/{}", source.filepath);
+
+    let mut stream = backend.open().await?;
+    let command_timeout = backend.chunk_read_timeout;
+
+    // Ask the server what it thinks the file size is. Our local index TSV is
+    // from a 2021 Zenodo snapshot and known to disagree with the live server
+    // for some files. The server's reply is authoritative for this attempt.
+    // The call is wrapped in the same per-chunk timeout as data reads so a
+    // silently-throttled server cannot stall the entire attempt before any
+    // bytes flow.
+    let size_call = stream.size(&server_path);
+    let size_result = if let Some(timeout) = command_timeout {
+        tokio::time::timeout(timeout, size_call)
+            .await
+            .with_context(|| {
+                format!(
+                    "FTPS SIZE for {} did not respond in {timeout:?}",
+                    source.filepath,
+                )
+            })?
+    } else {
+        size_call.await
+    };
+    let expected_bytes = match size_result {
+        Ok(actual) => {
+            let actual = u64::try_from(actual).context("FTPS SIZE does not fit u64")?;
+            if actual != indexed_bytes {
+                sink.log(format!(
+                    "FTPS SIZE for {} reports {actual} bytes (index expected {indexed_bytes}), using server's number",
+                    source.filepath,
+                ));
+            }
+            actual
+        }
+        Err(error) => {
+            sink.log(format!(
+                "FTPS SIZE for {} refused ({error}), proceeding with indexed size {indexed_bytes}",
+                source.filepath,
+            ));
+            indexed_bytes
+        }
+    };
+
+    // The server's number may have just turned the existing .part into a
+    // complete file. Honor that without opening a data channel.
     if existing_part == expected_bytes {
+        stream.quit().await.ok();
         fs::rename(&part_path, &destination).with_context(|| {
             format!(
                 "failed to rename complete partial {} to {}",
@@ -260,22 +379,41 @@ async fn download_once(
         return Ok(expected_bytes);
     }
 
-    let volume = source
-        .volume
-        .as_deref()
-        .with_context(|| format!("source file {} has no FTPS volume mapping", source.filepath))?;
-    let server_path = format!("/{volume}/{}", source.filepath);
+    // The server's number is smaller than what we already have on disk.
+    // Our .part is bogus (mismatched index, truncated server file, etc.).
+    // Discard it and re-download from scratch.
+    let existing_part = if existing_part > expected_bytes {
+        sink.log(format!(
+            "local .part for {} is {existing_part} bytes but server reports {expected_bytes}, restarting from zero",
+            source.filepath,
+        ));
+        0
+    } else {
+        existing_part
+    };
 
-    let mut stream = backend.open().await?;
     let can_resume = existing_part > 0 && existing_part < expected_bytes;
     let resume_accepted = if can_resume {
         let offset = usize::try_from(existing_part)
             .with_context(|| format!("REST offset {existing_part} does not fit usize"))?;
-        match stream.resume_transfer(offset).await {
+        let rest_call = stream.resume_transfer(offset);
+        let rest_result = if let Some(timeout) = command_timeout {
+            tokio::time::timeout(timeout, rest_call)
+                .await
+                .with_context(|| {
+                    format!(
+                        "FTPS REST for {} did not respond in {timeout:?}",
+                        source.filepath,
+                    )
+                })?
+        } else {
+            rest_call.await
+        };
+        match rest_result {
             Ok(()) => true,
             Err(error) => {
                 sink.log(format!(
-                    "FTPS did not accept REST resume for {} ({error}); restarting from zero",
+                    "FTPS did not accept REST resume for {} ({error}), restarting from zero",
                     source.filepath
                 ));
                 false
@@ -311,17 +449,35 @@ async fn download_once(
         });
     }
 
+    let chunk_read_timeout = backend.chunk_read_timeout;
     let transfer = async {
-        let mut data = stream
-            .retr_as_stream(&server_path)
-            .await
-            .with_context(|| format!("failed to start FTPS RETR for {server_path}"))?;
+        let retr_call = stream.retr_as_stream(&server_path);
+        let mut data = match chunk_read_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, retr_call)
+                .await
+                .with_context(|| {
+                    format!("FTPS RETR for {server_path} did not respond in {timeout:?}")
+                })?,
+            None => retr_call.await,
+        }
+        .with_context(|| format!("failed to start FTPS RETR for {server_path}"))?;
         let mut buf = vec![0_u8; 64 * 1024];
         loop {
-            let read = data
-                .read(&mut buf)
-                .await
-                .with_context(|| format!("failed to read FTPS stream for {server_path}"))?;
+            let read_future = data.read(&mut buf);
+            let read = if let Some(per_chunk) = chunk_read_timeout {
+                tokio::time::timeout(per_chunk, read_future)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "FTPS data channel for {server_path} delivered no bytes in {per_chunk:?}",
+                        )
+                    })?
+                    .with_context(|| format!("failed to read FTPS stream for {server_path}"))?
+            } else {
+                read_future
+                    .await
+                    .with_context(|| format!("failed to read FTPS stream for {server_path}"))?
+            };
             if read == 0 {
                 break;
             }
@@ -334,10 +490,16 @@ async fn download_once(
                 delivered: downloaded,
             });
         }
-        stream
-            .finalize_retr_stream(data)
-            .await
-            .with_context(|| format!("failed to finalize FTPS RETR for {server_path}"))?;
+        let finalize_call = stream.finalize_retr_stream(data);
+        match chunk_read_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, finalize_call)
+                .await
+                .with_context(|| {
+                    format!("FTPS finalize RETR for {server_path} did not respond in {timeout:?}")
+                })?,
+            None => finalize_call.await,
+        }
+        .with_context(|| format!("failed to finalize FTPS RETR for {server_path}"))?;
         anyhow::Ok(())
     };
 

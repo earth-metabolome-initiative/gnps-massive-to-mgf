@@ -1,7 +1,7 @@
 //! Binary entrypoint for the MassIVE mzML to MGF pipeline.
 
 use anyhow::{Context, bail};
-use gnps_massive_to_mgf::{
+use massive::{
     Config, DownloadFilter, IndexFreshness, ProgressReporter, StateDb, convert_downloaded_mzml,
     ensure_openformats_indexes_fresh, ingest_openformats, ingest_volume_manifest, run_download_tui,
 };

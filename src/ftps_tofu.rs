@@ -128,7 +128,7 @@ impl TofuCertVerifier {
         }
         let body = format!(
             "# FTPS server certificate pin (SHA-256 over the leaf cert, hex).\n\
-             # Recorded automatically by the gnps-massive-to-mgf TOFU verifier.\n\
+             # Recorded automatically by the massive-cli TOFU verifier.\n\
              # Delete this file to re-trust the server on the next connection.\n\
              {}\n",
             hex_encode(digest),

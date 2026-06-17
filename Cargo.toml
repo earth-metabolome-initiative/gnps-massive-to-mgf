@@ -1,13 +1,22 @@
 [package]
-name = "gnps-massive-to-mgf"
+name = "massive-cli"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
 description = "Build a deduplicated MassIVE mzML-derived MS/MS MGF corpus."
-repository = "https://github.com/LucaCappelletti94/gnps-massive-to-mgf"
+repository = "https://github.com/LucaCappelletti94/massive-cli"
 keywords = ["mass-spectrometry", "mzml", "mgf", "massive", "gnps"]
 categories = ["science"]
+publish = false
+
+[lib]
+name = "massive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "massive"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
