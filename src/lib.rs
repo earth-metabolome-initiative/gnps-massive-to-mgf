@@ -5,7 +5,8 @@
     reason = "the binary uses #[tokio::main(flavor = \"current_thread\")] so async tasks never migrate across threads; the Send bound this lint enforces is not meaningful for our runtime choice"
 )]
 
-mod checksum;
+/// File and byte-slice SHA-256 helpers.
+pub mod checksum;
 
 /// Streaming spectrum aggregator for the download TUI.
 pub mod aggregator;

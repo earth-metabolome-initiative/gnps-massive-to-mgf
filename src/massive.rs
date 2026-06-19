@@ -187,6 +187,8 @@ pub async fn download_pending_mzml_with_backend(
         totals,
         remaining_indexed: remaining,
     });
+    let outcome = db.download_outcome_totals()?;
+    sink.send(ProgressEvent::OutcomeUpdated { outcome });
 
     while remaining > 0 {
         let batch = db.pending_downloads_filtered(1, filter)?;
@@ -223,6 +225,8 @@ pub async fn download_pending_mzml_with_backend(
                 });
             }
         }
+        let outcome = db.download_outcome_totals()?;
+        sink.send(ProgressEvent::OutcomeUpdated { outcome });
         remaining = db.count_status(SourceFileStatus::Indexed)?;
     }
     sink.send(ProgressEvent::DownloadFinished { downloaded, failed });

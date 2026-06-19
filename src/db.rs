@@ -66,6 +66,15 @@ pub struct SourceFileRow {
     /// rows rather than fall back to HTTPS.
     #[diesel(sql_type = Nullable<Text>)]
     pub volume: Option<String>,
+    /// Lowercased dataset-level keywords copied from the volume manifest.
+    /// `None` when the manifest had no entry for this dataset.
+    #[diesel(sql_type = Nullable<Text>)]
+    pub keywords: Option<String>,
+    /// Dataset-level species string copied from the volume manifest. May
+    /// contain `###`-delimited multi-organism strings. `None` when the
+    /// manifest had no entry for this dataset.
+    #[diesel(sql_type = Nullable<Text>)]
+    pub species: Option<String>,
 }
 
 impl SourceFileRow {
@@ -158,6 +167,30 @@ pub struct DownloadProgressTotals {
     pub completed_bytes: u64,
 }
 
+/// Attempt-grounded outcome aggregates used to project the final corpus size.
+///
+/// The truncation ratio is `successful_delivered_bytes / successful_indexed_bytes`
+/// and the success rate is `successful_files / (successful_files + failed_files)`.
+/// Multiplying their product by `pending_indexed_bytes` and adding
+/// `successful_delivered_bytes` gives the expected bytes-on-disk once the queue
+/// drains. Both ratios are undefined while their denominators are zero, so the
+/// UI shows a placeholder until at least one file has finished attempting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DownloadOutcomeTotals {
+    /// Files that ended in `downloaded` status.
+    pub successful_files: u64,
+    /// Files that ended in `download_failed` status.
+    pub failed_files: u64,
+    /// Sum of `size_bytes` across successful downloads.
+    pub successful_indexed_bytes: u64,
+    /// Sum of `downloaded_bytes` across successful downloads (actual bytes on disk).
+    pub successful_delivered_bytes: u64,
+    /// Sum of `size_bytes` across rows still planned but not yet successful
+    /// (status in `indexed` or `download_failed`).
+    pub pending_indexed_bytes: u64,
+}
+
 /// Aggregate conversion counters for one top-k setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -247,12 +280,19 @@ CREATE TABLE IF NOT EXISTS source_files (
     converted_spectra INTEGER NOT NULL DEFAULT 0,
     converted_top_k INTEGER,
     volume TEXT,
+    keywords TEXT,
+    species TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS source_files_status_order_idx
     ON source_files(status, selected_order);
 CREATE INDEX IF NOT EXISTS source_files_dataset_idx
     ON source_files(dataset);
+CREATE TABLE IF NOT EXISTS ingest_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    config_signature TEXT NOT NULL,
+    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS spectra_seen (
     top_k_peaks INTEGER NOT NULL,
     splash TEXT NOT NULL,
@@ -298,6 +338,8 @@ CREATE INDEX IF NOT EXISTS source_file_conversions_status_idx
             .context("failed to initialize state schema")?;
         add_volume_column_if_missing(&mut self.connection)
             .context("failed to migrate source_files schema for volume column")?;
+        add_keywords_species_columns_if_missing(&mut self.connection)
+            .context("failed to migrate source_files schema for keywords/species columns")?;
         Ok(())
     }
 
@@ -374,7 +416,8 @@ ON CONFLICT(filepath) DO UPDATE SET
     local_path = excluded.local_path,
     selected_order = excluded.selected_order,
     status = CASE
-        WHEN source_files.status IN ('downloaded', 'converted') THEN source_files.status
+        WHEN source_files.status IN ('downloaded', 'converted', 'download_failed')
+            THEN source_files.status
         ELSE excluded.status
     END,
     volume = COALESCE(excluded.volume, source_files.volume),
@@ -442,7 +485,7 @@ ON CONFLICT(filepath) DO UPDATE SET
             "\
 SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
        spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
-       volume
+       volume, keywords, species
 FROM source_files
 WHERE status = 'indexed'",
         );
@@ -548,6 +591,65 @@ WHERE status IN ('downloaded', 'indexed', 'download_failed')
         })
     }
 
+    /// Returns the attempt-grounded outcome counters used to project the
+    /// final corpus size (see [`DownloadOutcomeTotals`] for the math).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SQLite` rejects the query or returns negative
+    /// totals.
+    pub fn download_outcome_totals(&mut self) -> anyhow::Result<DownloadOutcomeTotals> {
+        #[derive(QueryableByName)]
+        struct OutcomeRow {
+            /// Files that ended in `downloaded`.
+            #[diesel(sql_type = BigInt)]
+            successful_files: i64,
+            /// Files that ended in `download_failed`.
+            #[diesel(sql_type = BigInt)]
+            failed_files: i64,
+            /// Sum of `size_bytes` across successful downloads.
+            #[diesel(sql_type = BigInt)]
+            successful_indexed_bytes: i64,
+            /// Sum of `downloaded_bytes` across successful downloads.
+            #[diesel(sql_type = BigInt)]
+            successful_delivered_bytes: i64,
+            /// Sum of `size_bytes` across rows still planned but not yet successful.
+            #[diesel(sql_type = BigInt)]
+            pending_indexed_bytes: i64,
+        }
+
+        let row = sql_query(
+            "\
+SELECT
+    COALESCE(SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END), 0) AS successful_files,
+    COALESCE(SUM(CASE WHEN status = 'download_failed' THEN 1 ELSE 0 END), 0) AS failed_files,
+    COALESCE(SUM(CASE WHEN status = 'downloaded' THEN size_bytes ELSE 0 END), 0) AS successful_indexed_bytes,
+    COALESCE(SUM(CASE WHEN status = 'downloaded' THEN COALESCE(downloaded_bytes, size_bytes) ELSE 0 END), 0) AS successful_delivered_bytes,
+    COALESCE(SUM(CASE WHEN status IN ('indexed', 'download_failed') THEN size_bytes ELSE 0 END), 0) AS pending_indexed_bytes
+FROM source_files
+WHERE status IN ('downloaded', 'indexed', 'download_failed')
+",
+        )
+        .get_result::<OutcomeRow>(&mut self.connection)
+        .context("failed to read download outcome totals")?;
+        Ok(DownloadOutcomeTotals {
+            successful_files: i64_to_u64(row.successful_files, "successful file count")?,
+            failed_files: i64_to_u64(row.failed_files, "failed file count")?,
+            successful_indexed_bytes: i64_to_u64(
+                row.successful_indexed_bytes,
+                "successful indexed byte count",
+            )?,
+            successful_delivered_bytes: i64_to_u64(
+                row.successful_delivered_bytes,
+                "successful delivered byte count",
+            )?,
+            pending_indexed_bytes: i64_to_u64(
+                row.pending_indexed_bytes,
+                "pending indexed byte count",
+            )?,
+        })
+    }
+
     /// Moves previously-failed downloads back to the indexed queue when their
     /// last attempt is older than `cooldown_seconds`.
     ///
@@ -603,6 +705,103 @@ WHERE dataset = ? AND (volume IS NULL OR volume <> ?)
         u64::try_from(updated).context("volume update count does not fit u64")
     }
 
+    /// Returns the row matching `filepath`, if any. Convenience used by
+    /// integration tests and ad-hoc inspection paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the query.
+    pub fn get_source_file(&mut self, filepath: &str) -> anyhow::Result<Option<SourceFileRow>> {
+        sql_query(
+            "\
+SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
+       spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
+       volume, keywords, species
+FROM source_files
+WHERE filepath = ?
+",
+        )
+        .bind::<Text, _>(filepath)
+        .get_result::<SourceFileRow>(&mut self.connection)
+        .optional()
+        .context("failed to load source row by filepath")
+    }
+
+    /// Sets the manifest-derived `keywords` and `species` columns for every
+    /// row of a dataset accession. Either argument may be empty to clear the
+    /// column. Returns the number of rows whose `keywords` or `species`
+    /// actually changed (so a no-op re-ingest reports zero updates).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the update.
+    pub fn update_dataset_metadata(
+        &mut self,
+        dataset: &str,
+        species: Option<&str>,
+        keywords: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        let updated = sql_query(
+            "\
+UPDATE source_files
+SET keywords = ?, species = ?, updated_at = CURRENT_TIMESTAMP
+WHERE dataset = ?
+  AND (
+    keywords IS NOT ? OR species IS NOT ?
+  )
+",
+        )
+        .bind::<Nullable<Text>, _>(keywords)
+        .bind::<Nullable<Text>, _>(species)
+        .bind::<Text, _>(dataset)
+        .bind::<Nullable<Text>, _>(keywords)
+        .bind::<Nullable<Text>, _>(species)
+        .execute(&mut self.connection)
+        .with_context(|| format!("failed to set metadata for dataset {dataset}"))?;
+        u64::try_from(updated).context("metadata update count does not fit u64")
+    }
+
+    /// Reads the most recent `ingest_state.config_signature`. Returns `None`
+    /// when the table is empty (first run, or freshly migrated database).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the query.
+    pub fn read_ingest_state(&mut self) -> anyhow::Result<Option<String>> {
+        #[derive(QueryableByName)]
+        struct Row {
+            /// Stored hex-encoded SHA-256.
+            #[diesel(sql_type = Text)]
+            config_signature: String,
+        }
+        let row = sql_query("SELECT config_signature FROM ingest_state WHERE id = 1")
+            .get_result::<Row>(&mut self.connection)
+            .optional()
+            .context("failed to read ingest state")?;
+        Ok(row.map(|row| row.config_signature))
+    }
+
+    /// Replaces the stored ingest-state signature with `signature`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if SQLite rejects the upsert.
+    pub fn write_ingest_state(&mut self, signature: &str) -> anyhow::Result<()> {
+        sql_query(
+            "\
+INSERT INTO ingest_state (id, config_signature, ingested_at)
+VALUES (1, ?, CURRENT_TIMESTAMP)
+ON CONFLICT(id) DO UPDATE SET
+    config_signature = excluded.config_signature,
+    ingested_at = excluded.ingested_at
+",
+        )
+        .bind::<Text, _>(signature)
+        .execute(&mut self.connection)
+        .context("failed to write ingest state")?;
+        Ok(())
+    }
+
     /// Counts source files in the planned download workload that lack a volume.
     ///
     /// The planned set is the same one used by
@@ -651,7 +850,7 @@ WHERE volume IS NULL
             "\
 SELECT filepath, dataset, collection, create_time, size_bytes, spectra_ms1,
        spectra_ms2, instrument_vendor, instrument_model, extension, local_path, status,
-       volume
+       volume, keywords, species
 FROM source_files
 WHERE status = 'downloaded'
   AND NOT EXISTS (
@@ -1262,22 +1461,44 @@ fn i64_to_u64(value: i64, label: &str) -> anyhow::Result<u64> {
 /// need an idempotent `ALTER TABLE` to pick it up. New databases get the
 /// column directly via the `CREATE TABLE` in [`StateDb::initialize`].
 fn add_volume_column_if_missing(connection: &mut SqliteConnection) -> anyhow::Result<()> {
+    add_text_column_if_missing(connection, "source_files", "volume")
+}
+
+/// Adds the `keywords` and `species` columns to `source_files` if they do not
+/// already exist. Same idempotency pattern as
+/// [`add_volume_column_if_missing`].
+fn add_keywords_species_columns_if_missing(
+    connection: &mut SqliteConnection,
+) -> anyhow::Result<()> {
+    add_text_column_if_missing(connection, "source_files", "keywords")?;
+    add_text_column_if_missing(connection, "source_files", "species")?;
+    Ok(())
+}
+
+/// Idempotently adds a nullable `TEXT` column to a table.
+fn add_text_column_if_missing(
+    connection: &mut SqliteConnection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<()> {
     #[derive(QueryableByName)]
     struct CountRow {
-        /// Number of existing columns named `volume` (0 or 1).
+        /// Number of existing columns with the requested name (0 or 1).
         #[diesel(sql_type = BigInt)]
         count: i64,
     }
 
-    let row = sql_query(
-        "SELECT COUNT(*) AS count FROM pragma_table_info('source_files') WHERE name = 'volume'",
-    )
-    .get_result::<CountRow>(connection)
-    .context("failed to inspect source_files columns")?;
+    let inspect_sql = format!(
+        "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name = '{column}'"
+    );
+    let row = sql_query(inspect_sql)
+        .get_result::<CountRow>(connection)
+        .with_context(|| format!("failed to inspect {table} columns"))?;
     if row.count == 0 {
+        let alter_sql = format!("ALTER TABLE {table} ADD COLUMN {column} TEXT");
         connection
-            .batch_execute("ALTER TABLE source_files ADD COLUMN volume TEXT")
-            .context("failed to add volume column to source_files")?;
+            .batch_execute(&alter_sql)
+            .with_context(|| format!("failed to add {column} column to {table}"))?;
     }
     Ok(())
 }

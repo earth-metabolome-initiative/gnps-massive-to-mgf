@@ -2,8 +2,9 @@
 
 use anyhow::{Context, bail};
 use massive::{
-    Config, DownloadFilter, IndexFreshness, ProgressReporter, StateDb, convert_downloaded_mzml,
-    ensure_openformats_indexes_fresh, ingest_openformats, ingest_volume_manifest, run_download_tui,
+    Config, DownloadFilter, IndexFreshness, ProgressReporter, StateDb, checksum,
+    convert_downloaded_mzml, ensure_openformats_indexes_fresh, ingest_openformats,
+    ingest_volume_manifest, run_download_tui,
 };
 
 /// Runs the requested pipeline subcommand.
@@ -49,10 +50,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refreshes the open-format indexes when the Zenodo record has been
-/// modified since the local TSVs were last downloaded, then re-ingests
-/// `source_files` if the TSVs were refreshed. Always re-ingests the volume
-/// manifest, which is idempotent and fast.
+/// Refreshes the open-format indexes when either the Zenodo record has been
+/// modified since the last fetch or the user has changed an ingest-relevant
+/// config knob (target MS2, source-selection buffer, keyword allowlist). The
+/// volume manifest is always re-ingested since it is fast and idempotent.
 async fn refresh_indexes_and_ingest(
     db: &mut StateDb,
     config: &Config,
@@ -61,12 +62,25 @@ async fn refresh_indexes_and_ingest(
     let freshness = ensure_openformats_indexes_fresh(config, progress)
         .await
         .context("failed to refresh open-format index files")?;
-    if matches!(freshness, IndexFreshness::Refreshed) {
+    let current_signature = ingest_config_signature(config);
+    let stored_signature = db
+        .read_ingest_state()
+        .context("failed to read prior ingest state")?;
+    let signature_changed = stored_signature.as_deref() != Some(current_signature.as_str());
+    let needs_reingest = matches!(freshness, IndexFreshness::Refreshed) || signature_changed;
+    if needs_reingest {
+        if signature_changed {
+            progress.println(
+                "ingest configuration changed (target MS2, buffer, or keyword allowlist), re-ingesting openformats index",
+            )?;
+        }
         let report = ingest_openformats(db, config, progress).context("failed to ingest index")?;
         progress.println(format!(
             "indexed MassIVE mzML files: {} queued, {} candidates, {} indexed MS/MS spectra",
             report.inserted_mzml, report.candidate_mzml, report.target_ms2_spectra
         ))?;
+        db.write_ingest_state(&current_signature)
+            .context("failed to persist new ingest state")?;
     }
     let volume_report = ingest_volume_manifest(db, config, progress)
         .context("failed to ingest MassIVE volume manifest")?;
@@ -77,4 +91,20 @@ async fn refresh_indexes_and_ingest(
         volume_report.missing_volume_after_ingest
     ))?;
     Ok(())
+}
+
+/// Fingerprints the ingest-relevant pieces of `Config` as a lowercase
+/// SHA-256 hex string. Used by [`refresh_indexes_and_ingest`] to detect
+/// changes to `TARGET_MS2_SPECTRA`, `SOURCE_SELECTION_BUFFER`, or
+/// `INGEST_KEYWORD_ALLOWLIST` between runs.
+fn ingest_config_signature(config: &Config) -> String {
+    let mut sorted_allowlist = config.ingest_keyword_allowlist.clone();
+    sorted_allowlist.sort();
+    let payload = format!(
+        "target_ms2={};source_selection_buffer={};ingest_keyword_allowlist={}",
+        config.target_ms2_spectra,
+        config.source_selection_buffer,
+        sorted_allowlist.join(","),
+    );
+    checksum::sha256_hex(payload.as_bytes())
 }

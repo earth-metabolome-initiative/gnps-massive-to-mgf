@@ -1,5 +1,6 @@
 //! Open-format index ingestion and source-file row models.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
@@ -129,6 +130,23 @@ pub struct IngestReport {
 
 /// Downloads are aimed at the deduplicated MassIVE superset only.
 ///
+/// The function makes two passes. The first walks the openformats TSV
+/// streaming-deserializing every mzML row into memory. Each row is annotated
+/// with a 0/1 priority based on whether the associated dataset's keywords
+/// match any entry in `config.ingest_keyword_allowlist`. After the read, the
+/// rows are stable-sorted (priority desc, original TSV order asc), so
+/// metabolomics / natural-products datasets fill the indexed set before
+/// alphabetically-first proteomics rows. Then the function upserts every row
+/// in priority order, marking the first N as `indexed` until the buffered MS2
+/// target is hit; everything after that becomes `candidate`. Each upsert
+/// receives a `selected_order` matching its position in the sorted list, so
+/// the downloader's `ORDER BY selected_order` pulls highest-priority files
+/// first.
+///
+/// When the allowlist is empty (default for tests, or user-cleared), every
+/// row scores zero and the behaviour collapses to "TSV order only", matching
+/// the pre-prioritization semantics.
+///
 /// # Errors
 ///
 /// Returns an error if the cached MassIVE TSV cannot be read or if the state
@@ -146,22 +164,48 @@ pub fn ingest_openformats(
 
     let rows = csv_row_count(&path)?;
     let bar = progress.row_bar(rows, "ingesting deduped MassIVE mzML index")?;
+    let mut skipped_unsupported = 0_u64;
+
+    let dataset_keywords = if config.ingest_keyword_allowlist.is_empty() {
+        HashMap::new()
+    } else {
+        load_dataset_keyword_map(&config.massive_volumes_path)?
+    };
+    let allowlist: Vec<&str> = config
+        .ingest_keyword_allowlist
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    // First pass: read every row + compute priority + buffer.
+    let mut buffered: Vec<(OpenFormatRecord, u8)> = Vec::with_capacity(512_000);
+    for row in reader.deserialize::<OpenFormatRecord>() {
+        let record = row.context("failed to parse MassIVE open-format row")?;
+        bar.inc(1);
+        if !record.is_mzml() {
+            skipped_unsupported = skipped_unsupported.saturating_add(1);
+            continue;
+        }
+        let priority = match dataset_keywords.get(&record.dataset) {
+            Some(keywords) if any_token_matches(keywords, &allowlist) => 1,
+            _ => 0,
+        };
+        buffered.push((record, priority));
+    }
+
+    // Stable sort: priority desc, TSV order preserved within tier.
+    buffered.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+
+    // Second pass: upsert in sorted order, assigning indexed vs candidate by
+    // cumulative MS2 against the buffered target.
     let mut inserted_mzml = 0_u64;
     let mut candidate_mzml = 0_u64;
-    let mut skipped_unsupported = 0_u64;
     let mut target_ms2_spectra = 0_u64;
     let selection_target =
         buffered_selection_target(config.target_ms2_spectra, config.source_selection_buffer);
-    let mut mzml_order = 0_u64;
 
     db.transaction(|db| {
-        for row in reader.deserialize::<OpenFormatRecord>() {
-            let record = row.context("failed to parse MassIVE open-format row")?;
-            bar.inc(1);
-            if !record.is_mzml() {
-                skipped_unsupported = skipped_unsupported.saturating_add(1);
-                continue;
-            }
+        for (mzml_order, (record, _priority)) in buffered.iter().enumerate() {
             let local_path = record.local_path(&config.mzml_download_dir)?;
             let expected_ms2 = record.ms2_count_floor();
             let status = if target_ms2_spectra < selection_target {
@@ -172,8 +216,8 @@ pub fn ingest_openformats(
                 candidate_mzml = candidate_mzml.saturating_add(1);
                 SourceFileStatus::Candidate
             };
-            db.upsert_source_file(&record, &local_path, mzml_order, status, None)?;
-            mzml_order = mzml_order.saturating_add(1);
+            let mzml_order = u64::try_from(mzml_order).context("mzml_order does not fit u64")?;
+            db.upsert_source_file(record, &local_path, mzml_order, status, None)?;
         }
         anyhow::Ok(())
     })?;
@@ -189,10 +233,56 @@ pub fn ingest_openformats(
     })
 }
 
+/// Returns whether `keywords` (the manifest's raw lowercase value) contains
+/// any allowlist token as a substring.
+fn any_token_matches(keywords: &str, allowlist: &[&str]) -> bool {
+    allowlist
+        .iter()
+        .any(|token| !token.is_empty() && keywords.contains(token))
+}
+
+/// Loads the dataset_accession -> lowercased keywords map from the volume
+/// manifest TSV without touching the database. Used by `ingest_openformats`
+/// to score each row before the upsert loop.
+fn load_dataset_keyword_map(path: &Path) -> anyhow::Result<HashMap<String, String>> {
+    let mut reader = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let mut map = HashMap::with_capacity(20_000);
+    let mut record = csv::ByteRecord::new();
+    while reader
+        .read_byte_record(&mut record)
+        .context("failed to read MassIVE volume-manifest row")?
+    {
+        let dataset_bytes = record.get(VOLUME_MANIFEST_DATASET_COLUMN).unwrap_or(&[]);
+        let keywords_bytes = record.get(VOLUME_MANIFEST_KEYWORDS_COLUMN).unwrap_or(&[]);
+        let dataset = std::str::from_utf8(dataset_bytes)
+            .context("dataset_accession column is not valid UTF-8")?
+            .trim();
+        if dataset.is_empty() || dataset == "dataset_accession" {
+            continue;
+        }
+        let keywords = String::from_utf8_lossy(keywords_bytes)
+            .trim()
+            .to_ascii_lowercase();
+        if keywords.is_empty() || keywords == "null" {
+            continue;
+        }
+        map.insert(dataset.to_owned(), keywords);
+    }
+    Ok(map)
+}
+
 /// Column index of `dataset_accession` in the MassIVE volumes manifest.
 const VOLUME_MANIFEST_DATASET_COLUMN: usize = 0;
 /// Column index of `volume` in the MassIVE volumes manifest.
 const VOLUME_MANIFEST_VOLUME_COLUMN: usize = 1;
+/// Column index of `species` in the MassIVE volumes manifest.
+const VOLUME_MANIFEST_SPECIES_COLUMN: usize = 2;
+/// Column index of `keywords` in the MassIVE volumes manifest.
+const VOLUME_MANIFEST_KEYWORDS_COLUMN: usize = 3;
 
 /// Summary returned after ingesting the dataset-level volume manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,18 +298,23 @@ pub struct VolumeIngestReport {
     pub missing_volume_after_ingest: u64,
 }
 
-/// Populates `source_files.volume` from the dataset-level volumes manifest.
+/// Populates `source_files.volume`, `source_files.keywords`, and
+/// `source_files.species` from the dataset-level volumes manifest.
 ///
 /// The manifest is a tab-separated file with the columns
-/// `dataset_accession, volume, species, keywords` (the latter two are ignored
-/// by this function). It maps every MassIVE dataset accession to the FTPS
-/// volume bucket under which `massive-ftp.ucsd.edu` exposes it. The FTPS
-/// downloader uses this to construct absolute server paths.
+/// `dataset_accession, volume, species, keywords`. Volume drives FTPS-path
+/// construction; keywords and species ride along into `source_files` so the
+/// downloader can score datasets at ingest time and the converter can stamp
+/// them as MGF headers.
 ///
-/// The function is idempotent: rows whose `volume` already matches the
-/// manifest are reported as `rows_skipped`. After ingest,
-/// [`StateDb::count_missing_volume`] reports how many planned downloads still
-/// lack a mapping, surfaced via `missing_volume_after_ingest`.
+/// The function is idempotent: rows whose `volume`, `keywords`, and `species`
+/// already match the manifest contribute nothing to `rows_updated`. After
+/// ingest, [`StateDb::count_missing_volume`] reports how many planned
+/// downloads still lack a mapping, surfaced via `missing_volume_after_ingest`.
+///
+/// Species and keyword bytes may be Latin-1 (e.g. `ó`, `á` in place names);
+/// we lossy-decode via [`String::from_utf8_lossy`] so the strict-UTF-8 layer
+/// never crashes.
 ///
 /// # Errors
 ///
@@ -231,10 +326,6 @@ pub fn ingest_volume_manifest(
     progress: &ProgressReporter,
 ) -> anyhow::Result<VolumeIngestReport> {
     let path = &config.massive_volumes_path;
-    // Read as byte records rather than `deserialize`: the species and keyword
-    // columns occasionally contain Latin-1 byte sequences (e.g. `ó`, `á` in
-    // Brazilian place names) that crash the strict-UTF-8 deserializer. We only
-    // need the first two columns, both of which are guaranteed ASCII.
     let mut reader = ReaderBuilder::new()
         .delimiter(b'\t')
         .flexible(true)
@@ -257,6 +348,8 @@ pub fn ingest_volume_manifest(
             rows_read = rows_read.saturating_add(1);
             let dataset_bytes = record.get(VOLUME_MANIFEST_DATASET_COLUMN).unwrap_or(&[]);
             let volume_bytes = record.get(VOLUME_MANIFEST_VOLUME_COLUMN).unwrap_or(&[]);
+            let species_bytes = record.get(VOLUME_MANIFEST_SPECIES_COLUMN).unwrap_or(&[]);
+            let keywords_bytes = record.get(VOLUME_MANIFEST_KEYWORDS_COLUMN).unwrap_or(&[]);
             let dataset = std::str::from_utf8(dataset_bytes)
                 .context("dataset_accession column is not valid UTF-8")?
                 .trim();
@@ -267,8 +360,12 @@ pub fn ingest_volume_manifest(
                 rows_skipped = rows_skipped.saturating_add(1);
                 continue;
             }
-            let updated = db.update_dataset_volume(dataset, volume)?;
-            rows_updated = rows_updated.saturating_add(updated);
+            let species = nullable_string(species_bytes);
+            let keywords = nullable_string(keywords_bytes).map(|raw| raw.to_ascii_lowercase());
+            let volume_updated = db.update_dataset_volume(dataset, volume)?;
+            let metadata_updated =
+                db.update_dataset_metadata(dataset, species.as_deref(), keywords.as_deref())?;
+            rows_updated = rows_updated.saturating_add(volume_updated.max(metadata_updated));
         }
         anyhow::Ok(())
     })?;
@@ -283,6 +380,17 @@ pub fn ingest_volume_manifest(
         rows_skipped,
         missing_volume_after_ingest,
     })
+}
+
+/// Lossy-decodes a manifest byte field and returns `None` for empty or
+/// literal `NULL` values; otherwise returns the trimmed string.
+fn nullable_string(bytes: &[u8]) -> Option<String> {
+    let trimmed = String::from_utf8_lossy(bytes).trim().to_owned();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Returns the indexed MS/MS source-selection target after applying the buffer.
@@ -402,6 +510,69 @@ MSV000000001/d.mgf\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t100\tvendo
         Ok(())
     }
 
+    /// Confirms metabolomics-tagged rows fill the indexed set ahead of
+    /// alphabetically-first proteomics rows, and that keywords + species
+    /// columns are populated by the volume manifest.
+    #[test]
+    fn ingest_prioritizes_allowlist_keyword_datasets() -> anyhow::Result<()> {
+        let tempdir = tempdir()?;
+        write_massive_index(
+            tempdir.path(),
+            "\
+filepath\tdataset\tcollection\tcreate_time\tsize\tsize_mb\tspectra_ms1\tspectra_ms2\tinstrument_vendor\tinstrument_model\textension
+MSV000000001/a.mzML\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t6\tvendor\tmodel\t.mzML
+MSV000000001/b.mzML\tMSV000000001\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t5\tvendor\tmodel\t.mzML
+MSV000000002/c.mzML\tMSV000000002\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t9\tvendor\tmodel\t.mzML
+MSV000000003/d.mzML\tMSV000000003\tpeak\t2021-01-01 00:00:00\t1\t1\t1\t100\tvendor\tmodel\t.mzML
+",
+        )?;
+        write_volume_manifest(
+            tempdir.path(),
+            "\
+dataset_accession\tvolume\tspecies\tkeywords
+MSV000000001\tv01\tHomo sapiens\tproteomics
+MSV000000002\tv01\tStreptomyces sp.\tmetabolomics;natural products
+MSV000000003\tv01\tNULL\tNULL
+",
+        )?;
+        let mut db = StateDb::connect(":memory:")?;
+        db.initialize()?;
+        let mut config = test_config(tempdir.path(), 10, 1.0);
+        config.ingest_keyword_allowlist = vec!["metabolomics".to_owned()];
+        let report = ingest_openformats(&mut db, &config, &ProgressReporter::hidden())?;
+        // selection_target = target_ms2 * buffer = 10 * 1.0 = 10 spectra.
+        // Metabolomics row (9 MS2) lands first, then alphabetical proteomics
+        // a.mzML (6 MS2) tips us past the cap. b.mzML and d.mzML stay candidate.
+        assert_eq!(report.inserted_mzml, 2);
+        assert_eq!(report.candidate_mzml, 2);
+        assert_eq!(report.skipped_unsupported, 0);
+        assert_eq!(report.target_ms2_spectra, 15);
+
+        let volume_report = ingest_volume_manifest(&mut db, &config, &ProgressReporter::hidden())?;
+        assert_eq!(volume_report.missing_volume_after_ingest, 0);
+
+        let metabolomics_row = single_source(&mut db, "MSV000000002/c.mzML")?;
+        assert_eq!(metabolomics_row.status, "indexed");
+        assert_eq!(
+            metabolomics_row.keywords.as_deref(),
+            Some("metabolomics;natural products")
+        );
+        assert_eq!(
+            metabolomics_row.species.as_deref(),
+            Some("Streptomyces sp.")
+        );
+
+        let proteomics_row = single_source(&mut db, "MSV000000001/a.mzML")?;
+        assert_eq!(proteomics_row.status, "indexed");
+        assert_eq!(proteomics_row.keywords.as_deref(), Some("proteomics"));
+
+        let unmatched = single_source(&mut db, "MSV000000003/d.mzML")?;
+        assert_eq!(unmatched.status, "candidate");
+        assert!(unmatched.keywords.is_none());
+        assert!(unmatched.species.is_none());
+        Ok(())
+    }
+
     /// Confirms unsafe indexed paths roll back the ingestion transaction.
     #[test]
     fn ingest_rejects_unsafe_paths_and_rolls_back() -> anyhow::Result<()> {
@@ -502,6 +673,12 @@ MSV000000001\tv01\tNULL\tNULL
         Ok(())
     }
 
+    /// Looks up a single `source_files` row by filepath, panicking if absent.
+    fn single_source(db: &mut StateDb, filepath: &str) -> anyhow::Result<crate::db::SourceFileRow> {
+        db.get_source_file(filepath)?
+            .with_context(|| format!("expected source_files row {filepath} after ingest"))
+    }
+
     /// Builds a minimal test configuration rooted in a temporary directory.
     fn test_config(root: &Path, target_ms2_spectra: u64, source_selection_buffer: f64) -> Config {
         Config {
@@ -525,6 +702,7 @@ MSV000000001\tv01\tNULL\tNULL
             ftps_transfer_timeout: None,
             ftps_chunk_read_timeout: None,
             download_failure_cooldown: Duration::from_secs(0),
+            ingest_keyword_allowlist: Vec::new(),
         }
     }
 }

@@ -31,7 +31,9 @@ use ratatui::layout::Rect;
 
 use crate::aggregator::{self, AggregateEvent, AggregateSnapshot, AggregatorJob};
 use crate::config::Config;
-use crate::db::{DownloadFilter, DownloadProgressTotals, SourceFileRow, StateDb};
+use crate::db::{
+    DownloadFilter, DownloadOutcomeTotals, DownloadProgressTotals, SourceFileRow, StateDb,
+};
 use crate::massive::download_pending_mzml;
 use crate::progress_sink::{ProgressEvent, ProgressSink};
 
@@ -173,6 +175,9 @@ pub struct App {
     /// renderer each frame. Consumed by the mouse handler to map a click
     /// position to a tab.
     pub tab_rects: Vec<(RunningTab, Rect)>,
+    /// Latest attempt-grounded outcome snapshot, used by the running screen
+    /// to project the final on-disk corpus size.
+    pub outcome: DownloadOutcomeTotals,
 }
 
 impl App {
@@ -413,6 +418,9 @@ impl App {
                 self.push_log(format!("download failed: {filepath} | {error}"));
                 self.current = None;
             }
+            ProgressEvent::OutcomeUpdated { outcome } => {
+                self.outcome = outcome;
+            }
             ProgressEvent::DownloadFinished { downloaded, failed } => {
                 self.downloaded = downloaded;
                 self.failed = failed;
@@ -581,6 +589,8 @@ mod tests {
             local_path: "/tmp/x".to_owned(),
             status: "indexed".to_owned(),
             volume: Some("v01".to_owned()),
+            keywords: None,
+            species: None,
         }
     }
 

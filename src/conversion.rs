@@ -411,6 +411,16 @@ fn prepare_ms2_record(
         precursor_metadata.precursor_id.as_deref(),
     ));
     metadata.insert_arbitrary_metadata("TOP_K_PEAKS", config.top_k_peaks.to_string());
+    if let Some(keywords) = source.keywords.as_deref()
+        && !keywords.is_empty()
+    {
+        metadata.insert_arbitrary_metadata("MASSIVE_KEYWORDS", keywords.to_owned());
+    }
+    if let Some(species) = source.species.as_deref()
+        && !species.is_empty()
+    {
+        metadata.insert_arbitrary_metadata("MASSIVE_SPECIES", species.to_owned());
+    }
     let record = MascotGenericFormat::new(metadata, precursor_metadata.mz, mzs, intensities)?;
     Ok(PreparedSpectrum::Ready(Box::new(PreparedReadySpectrum {
         record,
@@ -1481,6 +1491,47 @@ mod tests {
         Ok(())
     }
 
+    /// Confirms the manifest-derived `keywords` and `species` on a
+    /// `SourceFileRow` round-trip into the MGF as `MASSIVE_KEYWORDS=` and
+    /// `MASSIVE_SPECIES=` headers.
+    #[test]
+    fn written_mgf_propagates_massive_keywords_and_species() -> anyhow::Result<()> {
+        let mut source = test_source_row();
+        source.keywords = Some("metabolomics;natural products".to_owned());
+        source.species = Some("Streptomyces sp.".to_owned());
+
+        let mut metadata = MascotGenericFormatMetadata::new_with_smiles_and_ion_mode(
+            Some(format!("{}:1", source.dataset)),
+            2,
+            Some(12.5),
+            Some(1),
+            Some(source.filepath.clone()),
+            None,
+            Some(MascotIonMode::Positive),
+        )?;
+        if let Some(keywords) = source.keywords.as_deref() {
+            metadata.insert_arbitrary_metadata("MASSIVE_KEYWORDS", keywords.to_owned());
+        }
+        if let Some(species) = source.species.as_deref() {
+            metadata.insert_arbitrary_metadata("MASSIVE_SPECIES", species.to_owned());
+        }
+
+        let record = MascotGenericFormat::new(metadata, 200.0, vec![100.0_f64], vec![10.0_f64])?;
+        let mut bytes = Vec::new();
+        record.write_to(&mut bytes)?;
+        let text = String::from_utf8(bytes)?;
+
+        assert!(
+            text.contains("\nMASSIVE_KEYWORDS=metabolomics;natural products\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nMASSIVE_SPECIES=Streptomyces sp.\n"),
+            "{text}"
+        );
+        Ok(())
+    }
+
     /// Confirms differently written mzML metadata names resolve to stable MGF headers.
     #[test]
     fn normalizes_known_mzml_metadata_aliases() {
@@ -1738,6 +1789,7 @@ mod tests {
             ftps_transfer_timeout: None,
             ftps_chunk_read_timeout: None,
             download_failure_cooldown: Duration::from_secs(0),
+            ingest_keyword_allowlist: Vec::new(),
         }
     }
 
@@ -1774,6 +1826,8 @@ mod tests {
             local_path: "/tmp/test.mzML".to_owned(),
             status: "downloaded".to_owned(),
             volume: Some("v01".to_owned()),
+            keywords: None,
+            species: None,
         }
     }
 

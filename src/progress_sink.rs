@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::db::{DownloadProgressTotals, SourceFileRow};
+use crate::db::{DownloadOutcomeTotals, DownloadProgressTotals, SourceFileRow};
 
 /// One discrete update from the download path to its UI consumer.
 #[derive(Debug, Clone)]
@@ -68,6 +68,13 @@ pub enum ProgressEvent {
         filepath: String,
         /// Combined error message (`format!("{error:#}")`).
         error: String,
+    },
+    /// Refreshed outcome counters from the database, used to project the
+    /// final corpus size. Sent at loop entry and after every successful or
+    /// failed file.
+    OutcomeUpdated {
+        /// Latest snapshot of the outcome aggregates.
+        outcome: DownloadOutcomeTotals,
     },
     /// The download loop has exited. Carries final tallies.
     DownloadFinished {

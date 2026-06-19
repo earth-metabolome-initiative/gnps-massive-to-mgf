@@ -137,7 +137,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 fn render_left(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(8)])
+        .constraints([Constraint::Min(10), Constraint::Length(9)])
         .split(area);
     render_current_file(frame, chunks[0], app);
     render_progress(frame, chunks[1], app);
@@ -201,6 +201,7 @@ fn render_progress(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inner);
@@ -260,6 +261,7 @@ fn render_progress(frame: &mut Frame, area: Rect, app: &App) {
         }));
     frame.render_widget(total_gauge, rows[1]);
 
+    let final_line = format_outcome_estimate(&app.outcome, planned_bytes);
     let files_line = format!(
         "files  : {downloaded} downloaded, {failed} failed, {remaining} remaining of {planned_files} planned",
         downloaded = app.downloaded,
@@ -275,8 +277,44 @@ fn render_progress(frame: &mut Frame, area: Rect, app: &App) {
         },
     );
 
-    frame.render_widget(Paragraph::new(files_line), rows[2]);
-    frame.render_widget(Paragraph::new(attempt_line), rows[3]);
+    frame.render_widget(Paragraph::new(final_line), rows[2]);
+    frame.render_widget(Paragraph::new(files_line), rows[3]);
+    frame.render_widget(Paragraph::new(attempt_line), rows[4]);
+}
+
+/// Formats the "estimated final corpus" line for the Progress block. Returns
+/// a placeholder while no attempts have completed.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "display-only success-rate and truncation math"
+)]
+fn format_outcome_estimate(
+    outcome: &crate::db::DownloadOutcomeTotals,
+    planned_bytes: u64,
+) -> String {
+    let attempted = outcome.successful_files + outcome.failed_files;
+    if attempted == 0 {
+        return "final  : (waiting for first attempt)".to_owned();
+    }
+    let success_rate = outcome.successful_files as f64 / attempted as f64;
+    let truncation_ratio = if outcome.successful_indexed_bytes == 0 {
+        1.0
+    } else {
+        outcome.successful_delivered_bytes as f64 / outcome.successful_indexed_bytes as f64
+    };
+    let projected_pending = success_rate * truncation_ratio * outcome.pending_indexed_bytes as f64;
+    let final_bytes = outcome.successful_delivered_bytes as f64 + projected_pending.max(0.0);
+    let final_bytes = final_bytes.min(u64::MAX as f64) as u64;
+    format!(
+        "final  : ~{} of {} planned ({:.0}% success x {:.0}% size over {attempted} attempt(s))",
+        format_bytes(final_bytes),
+        format_bytes(planned_bytes),
+        success_rate * 100.0,
+        truncation_ratio * 100.0,
+    )
 }
 
 /// Renders the right pane: tab header + the body of the selected tab.

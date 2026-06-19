@@ -19,7 +19,7 @@ const DEFAULT_MZML_DOWNLOAD_DIR: &str = "/mnt/bfd/mzml";
 /// Default generated MGF output directory.
 const DEFAULT_MGF_OUTPUT_DIR: &str = "/mnt/bfd/mgf";
 /// Default target number of retained MS/MS spectra.
-const DEFAULT_TARGET_MS2_SPECTRA: u64 = 200_000_000;
+const DEFAULT_TARGET_MS2_SPECTRA: u64 = 1_000_000_000;
 /// Default number of fragment peaks retained per MS/MS spectrum.
 const DEFAULT_TOP_K_PEAKS: usize = 256;
 /// Default number of spectra written per compressed MGF shard.
@@ -45,7 +45,20 @@ const DEFAULT_FTPS_CHUNK_READ_TIMEOUT_SECONDS: u64 = 15;
 /// Default cooldown applied to `download_failed` rows before they are eligible
 /// to retry. Keeps a `download` invocation from immediately reattempting files
 /// that just failed (likely server-side broken or in a per-IP cool-down).
-const DEFAULT_DOWNLOAD_FAILURE_COOLDOWN_SECONDS: u64 = 86_400;
+const DEFAULT_DOWNLOAD_FAILURE_COOLDOWN_SECONDS: u64 = 604_800;
+/// Default keyword tokens that mark a dataset as worth indexing first. Each
+/// token is a lowercase substring matched against the manifest's `keywords`
+/// column. Datasets whose keywords match any token are picked into the
+/// `indexed` set before non-matching datasets, so the target-MS2 cap fills
+/// with metabolomics / natural-product data before alphabetically-first
+/// proteomics files.
+const DEFAULT_INGEST_KEYWORD_ALLOWLIST: &[&str] = &[
+    "metabolomics",
+    "natural products",
+    "lipidomics",
+    "untargeted metabolomics",
+    "datasettype:metabolomics",
+];
 /// Default source selection buffer over the requested final unique target.
 const DEFAULT_SOURCE_SELECTION_BUFFER: f64 = 1.25;
 /// Default extra indexed MS/MS spectra promoted when the unique target is short.
@@ -105,6 +118,11 @@ pub struct Config {
     /// on the next `download` run. Recently-failed files skip the retry until
     /// at least this duration has elapsed since their last attempt.
     pub download_failure_cooldown: Duration,
+    /// Lowercase keyword tokens that prioritize a dataset during ingest. The
+    /// list is matched (substring, case-insensitive) against the manifest's
+    /// `keywords` column. Matching datasets fill the `indexed` set first; the
+    /// rest fall to `candidate` once the target-MS2 cap is hit.
+    pub ingest_keyword_allowlist: Vec<String>,
 }
 
 impl Config {
@@ -186,6 +204,8 @@ impl Config {
             "DOWNLOAD_FAILURE_COOLDOWN_SECONDS",
             DEFAULT_DOWNLOAD_FAILURE_COOLDOWN_SECONDS,
         )?;
+        let ingest_keyword_allowlist =
+            parse_keyword_allowlist(read_env, "INGEST_KEYWORD_ALLOWLIST")?;
         let ftps_port_value = parse_u64(read_env, "FTPS_PORT", u64::from(DEFAULT_FTPS_PORT))?;
         let ftps_port = u16::try_from(ftps_port_value)
             .with_context(|| format!("FTPS_PORT {ftps_port_value} does not fit u16"))?;
@@ -248,6 +268,7 @@ impl Config {
             ftps_chunk_read_timeout: (ftps_chunk_read_timeout_seconds > 0)
                 .then(|| Duration::from_secs(ftps_chunk_read_timeout_seconds)),
             download_failure_cooldown: Duration::from_secs(download_failure_cooldown_seconds),
+            ingest_keyword_allowlist,
         })
     }
 
@@ -343,6 +364,30 @@ fn parse_path(
     Ok(Path::new(&parse_string(read_env, name, default)?).to_path_buf())
 }
 
+/// Parses a comma-separated keyword allowlist, falling back to
+/// [`DEFAULT_INGEST_KEYWORD_ALLOWLIST`]. Empty entries are dropped and every
+/// remaining entry is lowercased and trimmed once so downstream matching can
+/// skip case folding.
+fn parse_keyword_allowlist(
+    read_env: &impl Fn(&str) -> anyhow::Result<Option<String>>,
+    name: &str,
+) -> anyhow::Result<Vec<String>> {
+    let raw = read_env(name)?;
+    let source = raw.as_deref().unwrap_or("");
+    let mut tokens: Vec<String> = source
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() && raw.is_none() {
+        tokens = DEFAULT_INGEST_KEYWORD_ALLOWLIST
+            .iter()
+            .map(|token| (*token).to_owned())
+            .collect();
+    }
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -362,7 +407,17 @@ mod tests {
             config.massive_volumes_path,
             PathBuf::from("public_MSVs_2026_0615_0812.tsv"),
         );
-        assert_eq!(config.target_ms2_spectra, 200_000_000);
+        assert_eq!(config.target_ms2_spectra, 1_000_000_000);
+        assert_eq!(
+            config.ingest_keyword_allowlist,
+            vec![
+                "metabolomics".to_owned(),
+                "natural products".to_owned(),
+                "lipidomics".to_owned(),
+                "untargeted metabolomics".to_owned(),
+                "datasettype:metabolomics".to_owned(),
+            ],
+        );
         assert_eq!(config.top_k_peaks, 256);
         assert_eq!(config.ftps_host, "massive-ftp.ucsd.edu");
         assert_eq!(config.ftps_port, 21);
